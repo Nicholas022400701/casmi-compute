@@ -15,26 +15,26 @@ if [ ! -f wh/.done ]; then
   kaggle datasets download nicholasooo/casmi-m2-fwdsim-wheels -p wh --unzip -q
   (cd wh && for f in *2.6.0cpu*.whl; do mv "$f" "${f/2.6.0cpu/2.6.0+cpu}"; done; for f in *pt26cpu*.whl; do mv "$f" "${f/2.1.2pt26cpu/2.1.2+pt26cpu}"; done) && touch wh/.done
 fi
-uv pip install -q --no-index --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
-uv pip install -q numpy pandas h5py scipy scikit-learn tqdm pyyaml networkx einops psutil joblib matplotlib seaborn pathos
+uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf
+uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
 [ -f ftdata/labels.tsv ] || kaggle datasets download nicholasooo/casmi-m2-finetune-data -p ftdata --unzip -q
+python -c "import sys; sys.path.insert(0, 'ftdata'); import compat; compat.install(); import torch, dgl, ms_pred.magma.run_magma" 2>&1 | tail -3 | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g'
 echo "[$(date -u +%H:%M:%S)] setup done: $(nproc) cpus, $(free -g | awk '/Mem/{print $2}') GB"
 S=$(printf '%02d' "$SHARD"); OUT=$ROOT/out/shard_$S; mkdir -p "$OUT"
 if [ ! -f "$OUT/check.json" ]; then
   T=$(date +%s)
   python ftdata/labelShard.py --shard "$SHARD/$N" --data ftdata --out "$OUT" --workers "$WORKERS" > "$ROOT/log/shard_$S.log" 2>&1; RC=$?
   echo "[$(date -u +%H:%M:%S)] labelShard rc=$RC, $(( $(date +%s) - T )) s wall, skipped=$(grep -c -i 'skipping' "$ROOT/log/shard_$S.log")"
-  [ $RC -ne 0 ] && { echo "labelShard failed; last log lines (ids redacted):"; tail -15 "$ROOT/log/shard_$S.log" | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g'; exit 1; }
 fi
-UP=$ROOT/up/shard_$S; rm -rf "$UP"; mkdir -p "$UP"
-cp "$OUT/labels_shard.tsv" "$OUT/timing.json" "$OUT/check.json" "$UP/" && cp "$OUT"/magma_outputs/magma_tree.hdf5 "$UP/magma_tree.hdf5" && cp "$OUT"/subformulae/no_subform.hdf5 "$UP/no_subform.hdf5" || { echo "missing output files:"; find "$OUT" -maxdepth 2 | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g' | head -20; exit 1; }
-echo "timing: $(cat "$UP/timing.json" | tr -d '\n ' | cut -c1-400)"; echo "check: $(cat "$UP/check.json" | tr -d '\n ' | cut -c1-400)"
-python - "$UP" <<'PY'
+echo "timing: $(tr -d '\n ' < "$OUT/timing.json" | cut -c1-400)"; echo "check: $(tr -d '\n ' < "$OUT/check.json" | cut -c1-300)"
+python - "$OUT" <<'PY' || { echo "shard checks FAILED; last log lines (ids redacted):"; tail -12 "$ROOT/log/shard_$S.log" | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g'; rm -f "$OUT/check.json"; exit 1; }
 import json, sys
 t = json.load(open(sys.argv[1] + '/timing.json')); c = json.load(open(sys.argv[1] + '/check.json'))
-ok = t.get('magma_rc') == 0 and t.get('subform_rc') == 0 and all(v is True or (isinstance(v, dict) and v.get('ok') is True) for k, v in c.items() if 'ok' in k or isinstance(v, dict))
-print('CHECKS', 'OK' if ok else 'FAILED')
+ok = t.get('magma_rc') == 0 and t.get('subform_rc') == 0 and c.get('magma', {}).get('ok') is True and c.get('subform', {}).get('ok') is True
+print('CHECKS', 'OK' if ok else 'FAILED'); sys.exit(0 if ok else 1)
 PY
+UP=$ROOT/up/shard_$S; rm -rf "$UP"; mkdir -p "$UP"
+cp "$OUT/labels_shard.tsv" "$OUT/timing.json" "$OUT/check.json" "$UP/" && cp "$OUT"/magma_outputs/magma_tree.hdf5 "$UP/magma_tree.hdf5" && cp "$OUT"/subformulae/no_subform.hdf5 "$UP/no_subform.hdf5" || { echo "missing output files:"; find "$OUT" -maxdepth 2 | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g' | head -20; exit 1; }
 DS=nicholasooo/$DSPREFIX-s$S
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$DSPREFIX-s$S" "$DS" > "$UP/dataset-metadata.json"
 du -sh "$UP" | cut -f1
