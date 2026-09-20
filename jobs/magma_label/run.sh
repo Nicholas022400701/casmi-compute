@@ -21,17 +21,30 @@ uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter p
 python -c "import sys; sys.path.insert(0, 'ftdata'); import compat; compat.install(); import torch, dgl, ms_pred.magma.run_magma" 2>&1 | tail -3 | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g'
 echo "[$(date -u +%H:%M:%S)] setup done: $(nproc) cpus, $(free -g | awk '/Mem/{print $2}') GB"
 S=$(printf '%02d' "$SHARD"); OUT=$ROOT/out/shard_$S; mkdir -p "$OUT"
-if [ ! -f "$OUT/check.json" ]; then
+if [ ! -f "$OUT/timing.json" ]; then
   T=$(date +%s)
   python ftdata/labelShard.py --shard "$SHARD/$N" --data ftdata --out "$OUT" --workers "$WORKERS" > "$ROOT/log/shard_$S.log" 2>&1; RC=$?
   echo "[$(date -u +%H:%M:%S)] labelShard rc=$RC, $(( $(date +%s) - T )) s wall, skipped=$(grep -c -i 'skipping' "$ROOT/log/shard_$S.log")"
 fi
-echo "timing: $(tr -d '\n ' < "$OUT/timing.json" | cut -c1-400)"; echo "check: $(tr -d '\n ' < "$OUT/check.json" | cut -c1-300)"
-python - "$OUT" <<'PY' || { echo "shard checks FAILED; last log lines (ids redacted):"; tail -12 "$ROOT/log/shard_$S.log" | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g'; rm -f "$OUT/check.json"; exit 1; }
-import json, sys
-t = json.load(open(sys.argv[1] + '/timing.json')); c = json.load(open(sys.argv[1] + '/check.json'))
-ok = t.get('magma_rc') == 0 and t.get('subform_rc') == 0 and c.get('magma', {}).get('ok') is True and c.get('subform', {}).get('ok') is True
-print('CHECKS', 'OK' if ok else 'FAILED'); sys.exit(0 if ok else 1)
+echo "timing: $(tr -d '\n ' < "$OUT/timing.json" | cut -c1-400)"
+# checks (same rule as labelShard.py, relaxed per M2b: subform must cover every record, MAGMa may miss <= 1 % of records; misses are listed in check.json only)
+python - "$OUT" <<'PY' || { echo "shard checks FAILED; last log lines (ids redacted):"; tail -12 "$ROOT/log/shard_$S.log" | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g'; exit 1; }
+import json, sys, h5py, pandas as pd
+out = sys.argv[1]; t = json.load(open(out + '/timing.json'))
+specs = set(pd.read_csv(out + '/labels_shard.tsv', sep='\t')['spec']); c = {'records': len(specs)}
+for name, path in [('magma', out + '/magma_outputs/magma_tree.hdf5'), ('subform', out + '/subformulae/no_subform.hdf5')]:
+    try:
+        with h5py.File(path, 'r') as h: keys = set(h.keys())
+        got = {k.split('_collision')[0].split('.')[0] for k in keys} & specs
+        c[name] = {'keys': len(keys), 'matched': len(got), 'missing': sorted(specs - got), 'ok': len(got) == len(specs)}
+    except Exception as e:
+        c[name] = {'ok': False, 'error': str(e)[:300]}
+magmaOk = c['magma'].get('matched', 0) >= 0.99 * len(specs)
+ok = t.get('magma_rc') == 0 and t.get('subform_rc') == 0 and c['subform'].get('ok') is True and magmaOk
+c['accepted'] = ok; c['rule'] = 'rc==0, subform all records, magma >= 99 % of records'
+json.dump(c, open(out + '/check.json', 'w'), indent=1)
+print('check: records', len(specs), 'magma matched', c['magma'].get('matched'), 'missing', len(c['magma'].get('missing', [])), 'subform matched', c['subform'].get('matched'), '->', 'CHECKS OK' if ok else 'CHECKS FAILED')
+sys.exit(0 if ok else 1)
 PY
 UP=$ROOT/up/shard_$S; rm -rf "$UP"; mkdir -p "$UP"
 cp "$OUT/labels_shard.tsv" "$OUT/timing.json" "$OUT/check.json" "$UP/" && cp "$OUT"/magma_outputs/magma_tree.hdf5 "$UP/magma_tree.hdf5" && cp "$OUT"/subformulae/no_subform.hdf5 "$UP/no_subform.hdf5" || { echo "missing output files:"; find "$OUT" -maxdepth 2 | sed -E 's/[A-Za-z0-9_-]{12,}/<id>/g' | head -20; exit 1; }
