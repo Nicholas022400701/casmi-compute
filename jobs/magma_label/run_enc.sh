@@ -3,10 +3,11 @@
 # Input: one private Kaggle dataset file <IN_DS>/<IN_FILE> = tar (labels.tsv, spec_files.hdf5, split.tsv, labelShard.py, compat.py, assign_subformulae.py)
 # encrypted with `openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:CASMI_ENC_KEY`. Output: <DSPREFIX>-s<ii> private dataset with shard_<ii>.tar.zst.enc
 # (labels_shard.tsv, magma_tree.hdf5, no_subform.hdf5, timing.json, check.json) + summary.json (counts/timings only). Console: counts/timings only.
-# usage: KAGGLE_API_TOKEN=... CASMI_ENC_KEY=... IN_DS=nicholasooo/... IN_FILE=x.tar.enc SHARD=i N=n [WORKERS=4] [ROOT=$RUNNER_TEMP/w] [DSPREFIX=casmi-c1-ftlab] bash run_enc.sh
+# usage: KAGGLE_API_TOKEN=... CASMI_ENC_KEY=... IN_DS=nicholasooo/... IN_FILE=x.tar.enc|ft_full_s{S}.tar.enc SHARD=i N=n [INNER=0/1] [WORKERS=4] [ROOT=$RUNNER_TEMP/w] [DSPREFIX=casmi-c1-ftlab] bash run_enc.sh
 set -uo pipefail
 : "${SHARD:?}" "${N:?}" "${IN_DS:?}" "${IN_FILE:?}" "${CASMI_ENC_KEY:?}" "${KAGGLE_API_TOKEN:?}"
 WORKERS=${WORKERS:-4}; ROOT=${ROOT:-${RUNNER_TEMP:-/data/c1w}/ftlab}; DSPREFIX=${DSPREFIX:-casmi-c1-ftlab}; S=$(printf '%02d' "$SHARD")
+IN_FILE=${IN_FILE//\{S\}/$S}; INNER=${INNER:-$SHARD/$N}   # per-shard input tars: IN_FILE=ft_full_s{S}.tar.enc with INNER=0/1 (the tar holds only that shard)
 mkdir -p "$ROOT/log" && cd "$ROOT"
 export PATH=$HOME/.local/bin:$PATH
 which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
@@ -28,7 +29,7 @@ echo "[$(date -u +%H:%M:%S)] setup done: $(nproc) cpus, $(free -g | awk '/Mem/{p
 OUT=$ROOT/out/shard_$S; mkdir -p "$OUT"
 if [ ! -f "$OUT/timing.json" ]; then
   T=$(date +%s)
-  python data/labelShard.py --shard "$SHARD/$N" --data data --out "$OUT" --workers "$WORKERS" > "$ROOT/log/shard_$S.log" 2>&1; RC=$?
+  python data/labelShard.py --shard "$INNER" --data data --out "$OUT" --workers "$WORKERS" > "$ROOT/log/shard_$S.log" 2>&1; RC=$?
   echo "[$(date -u +%H:%M:%S)] labelShard rc=$RC, $(( $(date +%s) - T )) s wall"
 fi
 echo "timing: $(tr -d '\n ' < "$OUT/timing.json" | cut -c1-400)"
