@@ -8,6 +8,7 @@ set -uo pipefail
 mkdir -p "$ROOT/log" && cd "$ROOT"
 export PATH=$HOME/.local/bin:$PATH
 which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+[ -d venv ] && ! venv/bin/python -c "import sys" >/dev/null 2>&1 && rm -rf venv   # stale venv after a home reset (uv-managed interpreter gone)
 [ -d venv ] || uv venv -q --python 3.12 venv
 source venv/bin/activate
 uv pip install -q kaggle
