@@ -5,8 +5,10 @@
 # Output: private dataset nicholasooo/<DSPREFIX>-s<ii> with chunk*.parquet (runIceberg output columns) + summary.json; versioned every CKPT_MIN
 # minutes while running, so a reset loses <= CKPT_MIN minutes; on restart existing chunks are downloaded, validated and skipped.
 # usage: KAGGLE_API_TOKEN=... JOBS_DS=nicholasooo/... JOBS_FILE=jobs.parquet SHARD=i N=n DSPREFIX=casmi-c1-ice-<job> [THREADS=2] [CHUNK=512] [CKPT_MIN=10] [LIMIT=0] bash run.sh
+# SETUP_ONLY=1: build venv/wheels/src/ckpts (+ the job table if JOBS_DS/JOBS_FILE are set) and exit 0 after "setup done" — pre-warm a worker before a job.
 set -uo pipefail
-: "${SHARD:?}" "${N:?}" "${JOBS_DS:?}" "${JOBS_FILE:?}" "${DSPREFIX:?}" "${KAGGLE_API_TOKEN:?}"
+SETUP_ONLY=${SETUP_ONLY:-0}; [ "$SETUP_ONLY" = 1 ] && { SHARD=${SHARD:-0}; N=${N:-1}; JOBS_DS=${JOBS_DS:-}; JOBS_FILE=${JOBS_FILE:-}; DSPREFIX=${DSPREFIX:-setup}; }
+: "${SHARD:?}" "${N:?}" "${DSPREFIX:?}" "${KAGGLE_API_TOKEN:?}"; [ "$SETUP_ONLY" = 1 ] || : "${JOBS_DS:?}" "${JOBS_FILE:?}"
 THREADS=${THREADS:-2}; CHUNK=${CHUNK:-512}; CKPT_MIN=${CKPT_MIN:-10}; LIMIT=${LIMIT:-0}; MAXNODES=${MAXNODES:-100}; SPARSEK=${SPARSEK:-100}; BATCH=${BATCH:-16}
 CKPT_DS=${CKPT_DS:-nicholasooo/casmi-m2-fwdsim-assets}; GEN=${GEN:-iceberg_msg_all/gen/best.ckpt}; INTEN=${INTEN:-iceberg_msg_all/inten_contr/best.ckpt}   # ckpt dataset + paths inside it (e.g. CKPT_DS=nicholasooo/casmi-m2-ft-ckpt GEN=pilot_a/gen/best.ckpt INTEN=pilot_a/inten/best.ckpt)
 ROOT=${ROOT:-/data/c1w/ice}; S=$(printf '%02d' "$SHARD"); DS=nicholasooo/$DSPREFIX-s$S; OUT=$ROOT/out_$DSPREFIX/s$S
@@ -27,7 +29,8 @@ uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter p
 [ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }   # newer casmi-src versions unpack to casmi_src/src
 [ -f src/casmi/fwdsim/runIceberg.py ] || { echo 'casmi package missing after download'; exit 1; }
 CK=ck/${CKPT_DS#*/}; for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kaggle datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip; [ -f "$CK/$f" ] || { echo "ckpt missing: $f"; exit 1; }; done
-[ -f "jobs/$JOBS_FILE" ] || kaggle datasets download "$JOBS_DS" -f "$JOBS_FILE" -p jobs -q --unzip
+[ -z "$JOBS_FILE" ] || [ -f "jobs/$JOBS_FILE" ] || kaggle datasets download "$JOBS_DS" -f "$JOBS_FILE" -p jobs -q --unzip
+[ "$SETUP_ONLY" = 1 ] && { echo "[$(date -u +%H:%M:%S)] setup done (SETUP_ONLY): $(nproc) cpus; torch $(venv/bin/python -c "import torch,polars,rdkit;print(torch.__version__)"); ckpts ok; jobs ${JOBS_FILE:-none}"; echo "SETUP DONE rc=0"; exit 0; }
 # resume: fetch chunks already uploaded by an earlier incarnation of this worker, drop unreadable ones
 if kaggle datasets files "$DS" >/dev/null 2>&1 && [ -z "$(ls "$OUT"/chunk*.parquet 2>/dev/null)" ]; then kaggle datasets download "$DS" -p "$OUT" --unzip -q 2>/dev/null || true; fi
 python - "$OUT" <<'PY'
