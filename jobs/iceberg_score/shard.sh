@@ -15,6 +15,7 @@ ROOT=${ROOT:-$HOME/ice}; S=$(printf 's%02d' "$SHARD"); DS=nicholasooo/$DSPREFIX-
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 # every Kaggle call goes through kg(): up to 8 attempts with growing jittered backoff (matrix runs start 20-40 jobs at once -> the API answers 429 without this)
 kg() { local i R; for i in 1 2 3 4 5 6 7 8; do R=$(kaggle "$@" 2>&1) && { echo "$R"; return 0; }; case "$R" in *429*|*"Too Many"*|*timed*out*|*"Connection"*|*"503"*|*"502"*) log "kaggle ${1} ${2}: transient error (attempt $i)"; sleep $(( i * 15 + RANDOM % 30 ));; *) echo "$R"; return 1;; esac; done; echo "$R"; return 1; }
+dl() { local want=$1 i; shift; for i in 1 2 3; do [ -f "$want" ] && return 0; kg datasets download "$@" >/dev/null; [ -f "$want" ] || sleep $(( 20 + RANDOM % 40 )); done; [ -f "$want" ]; }   # dl <expected file> <kaggle download args>
 mkdir -p "$ROOT/log" "$OUT" "$ROOT/jobs" "$ROOT/ds" && cd "$ROOT"
 STAGGER=${STAGGER:-$(( RANDOM % 90 ))}; log "start stagger ${STAGGER}s (shard $SHARD)"; sleep "$STAGGER"
 # ---- setup (identical package set to pool.sh) ----
@@ -29,11 +30,11 @@ fi
 uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
 uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
 # pinned source snapshot (zip uploaded to SRC_DS, unpacked by Kaggle as <SRC_DIR>/src) and model checkpoints
-[ -f src/casmi/fwdsim/runShard.py ] || { rm -rf srcdl && kg datasets download "$SRC_DS" -p srcdl -q --unzip >/dev/null && mv "srcdl/$SRC_DIR/src" src && rm -rf srcdl; }
+[ -f src/casmi/fwdsim/runShard.py ] || { rm -rf srcdl && dl "srcdl/$SRC_DIR/src/casmi/fwdsim/runShard.py" "$SRC_DS" -p srcdl -q --unzip && mv "srcdl/$SRC_DIR/src" src && rm -rf srcdl; }
 [ -f src/casmi/fwdsim/runShard.py ] || { log 'src snapshot missing'; exit 1; }
-CK=ck/${CKPT_DS#*/}; for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kg datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip >/dev/null; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; exit 1; }; done
+CK=ck/${CKPT_DS#*/}; for f in "$GEN" "$INTEN"; do dl "$CK/$f" "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; exit 1; }; done
 # inputs + md5 pins
-for f in ${INPUTS//,/ }; do [ -f "jobs/$f" ] || kg datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip >/dev/null; [ -f "jobs/$f" ] || { log "input missing: $f"; exit 1; }; done
+for f in ${INPUTS//,/ }; do dl "jobs/$f" "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "input missing: $f"; exit 1; }; done
 PINNED=,; for kv in ${JOBS_MD5//,/ }; do f=${kv%%=*}; want=$(echo "${kv#*=}" | tr 'A-F' 'a-f'); [ -f "jobs/$f" ] || { log "md5 pin for unknown input $f"; exit 1; }; have=$(md5sum "jobs/$f" | cut -d' ' -f1); [ "$have" = "$want" ] || { log "input md5 mismatch $f: have $have want $want -> refusing"; exit 1; }; log "md5 ok $f"; PINNED="$PINNED$f,"; done
 if [ -n "$JOBS_MD5" ]; then for f in ${INPUTS//,/ }; do case "$PINNED" in *",$f,"*) ;; *) log "input $f has no md5 pin while JOBS_MD5 is set -> refusing"; exit 1;; esac; done; fi
 SRCC=$(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1); [ -n "$SRCC" ] || { log "src/COMMIT.txt missing -> refusing"; exit 1; }; case "$SRCC" in "${SRC_DIR#src_}"*) ;; *) log "src snapshot commit $SRCC does not match $SRC_DIR -> refusing"; exit 1;; esac
