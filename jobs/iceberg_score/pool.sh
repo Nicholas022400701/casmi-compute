@@ -1,0 +1,156 @@
+#!/bin/bash
+# C1 pool worker (swarm100 protocol, casmi2026-gold docs/plans/swarm100_pool.md): autonomous ICEBERG CPU scoring of shards claimed from pool/manifest.json.
+# env: ID=p00 IDX=0 KAGGLE_API_TOKEN GH_TOKEN  [KILLTEST=1: self-kill after first chunk of first shard, restart expected (resume test)]  [DIE=1: stop after first chunk, no restart (stale test)]
+# reads casmi-compute main: pool/manifest.json, pool/KILL (raw, <=5 min cache); heartbeat = branch hb/<ID> file hb.json (fetched at each claim for done/stale detection).
+# writes private dataset nicholasooo/<dsPrefix>-<ID>: <job>_s<NN>_chunk*.parquet + <job>_s<NN>_summary.json, one version per finished shard (no checkpoints).
+set -uo pipefail
+: "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
+REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool
+ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
+KILLTEST=${KILLTEST:-0}; DIE=${DIE:-0}; T_BOOT=$(date +%s); ERR429=0; JOBS_DONE=0; SETUP_SEC=0; SELFTEST=none; JOB=none; RATE=0
+log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+zz() { local n=$1 c; while [ "$n" -gt 0 ]; do c=$(( n > 600 ? 600 : n )); sleep "$c" || true; n=$(( n - c )); date -u; echo tick; done; }
+gitc() { git -c credential.helper= -c 'credential.helper=!f() { echo username=x; echo "password=$GH_TOKEN"; }; f' "$@"; }
+c429() { case "$1" in *429*|*"Too Many"*) ERR429=$((ERR429+1)); log "429 seen (total $ERR429)";; esac; }
+cat > hbw.py <<'PY'
+import json, os, sys, time
+k = ['id','idx','job','status','shard','chunk','jobsDone','rate','err429','setupSec','selftest','killtest']
+d = dict(zip(k, sys.argv[1:])); d['ts'] = time.time(); d['tsUtc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+for f in ('idx','chunk','jobsDone','err429','setupSec'): d[f] = int(d[f])
+d['shard'] = None if d['shard'] == '-' else int(d['shard']); d['rate'] = float(d['rate'])
+d['done'] = sorted(set(open('hb/done.txt').read().split())) if os.path.exists('hb/done.txt') else []
+print(json.dumps(d))
+PY
+cat > claim.py <<'PY'
+import json, subprocess, sys, time
+id_, idx, boot = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]); mf = json.load(open('manifest.json'))
+job, N, W, stale, grace = mf['job'], int(mf['N']), int(mf['W']), float(mf.get('staleMin', 30)), float(mf.get('graceMin', 20))
+def git(*a): return subprocess.run(['git', *a], cwd='hb', capture_output=True, text=True).stdout
+git('fetch', '-q', '-p', 'origin', '+refs/heads/hb/*:refs/remotes/hb/*')
+hbs = []
+for r in git('for-each-ref', '--format=%(refname)', 'refs/remotes/hb/').split():
+    try: hbs.append(json.loads(git('show', f'{r}:hb.json')))
+    except Exception: pass
+now = time.time(); done = set(); active = set(); byIdx = {}
+for h in hbs:
+    done |= {int(d.split(':')[1]) for d in h.get('done', []) if d.startswith(job + ':')}
+    if h.get('id') == id_: continue
+    byIdx.setdefault(h.get('idx'), []).append(h)
+    if h.get('job') == job and h.get('shard') is not None and h.get('status') in ('running', 'publishing', 'paused') and now - h.get('ts', 0) < stale * 60: active.add(int(h['shard']))
+own = [s for s in range(N) if s % W == idx and s not in done and s not in active]
+def stealable(s):
+    if s in done or s in active or s % W == idx: return False
+    o = byIdx.get(s % W)
+    if not o: return now - boot > grace * 60   # owner never heartbeated
+    h = max(o, key=lambda x: x.get('ts', 0))
+    return h.get('status') in ('idle', 'killed', 'err', 'selftestFail') or now - h.get('ts', 0) > stale * 60 or h.get('job') != job
+rest = [s for s in range(N - 1, -1, -1) if stealable(s)]
+print(own[0] if own else (rest[0] if rest else -1), len(done), len(active), len(hbs))
+PY
+cat > summ.py <<'PY'
+import glob, json, sys, polars as pl
+out, shard, n, rc, wall, jobs, chunk, job = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6], int(sys.argv[7]), sys.argv[8]
+total = pl.scan_parquet(jobs).select(pl.len()).collect().item(); nChunks = (total + chunk - 1) // chunk; mine = len(range(shard, nChunks, n))
+files = sorted(glob.glob(out + '/chunk*.parquet')); df = pl.concat([pl.read_parquet(f) for f in files]) if files else None
+rows = df.height if df is not None else 0; empty = int((df['mzs'].list.len() == 0).sum()) if df is not None else 0
+s = {'job': job, 'shard': f'{shard}/{n}', 'rc': rc, 'chunksDone': len(files), 'chunksExpected': mine, 'complete': len(files) == mine and rc == 0, 'rows': rows, 'emptyPredictions': empty, 'secPerJob': round(float(df['seconds'].mean()), 4) if df is not None else None, 'wallSec': wall}
+json.dump(s, open(out + '/summary.json', 'w'), indent=1); print('summary:', json.dumps(s))
+PY
+hb() {  # status [shard] [chunksDone]
+  python hbw.py "$ID" "$IDX" "$JOB" "$1" "${2:--}" "${3:-0}" "$JOBS_DONE" "$RATE" "$ERR429" "$SETUP_SEC" "$SELFTEST" "$KILLTEST$DIE" > hb/hb.json 2>/dev/null || return 0
+  ( cd hb && git add hb.json && { git commit -q --amend -m "hb $ID" >/dev/null 2>&1 || git commit -q -m "hb $ID" >/dev/null 2>&1; } && gitc push -qf origin "HEAD:refs/heads/hb/$ID" >/dev/null 2>&1 ) || log "hb push failed"
+}
+killState() {  # run | pause | kill  (pool/KILL on main: empty=run, PAUSE|KILL [id] per line)
+  local k; k=$(curl -sf --max-time 20 "$RAW/KILL" 2>/dev/null || true); local st=run
+  while read -r a b; do [ -z "$a" ] && continue; [ -n "$b" ] && [ "$b" != "$ID" ] && continue; case "$a" in KILL) st=kill;; PAUSE) [ "$st" = kill ] || st=pause;; esac; done <<< "$k"; echo $st
+}
+mf() { curl -sf --max-time 20 "$RAW/manifest.json" -o manifest.new && mv manifest.new manifest.json || log "manifest fetch failed"; python -c "import json;print(json.load(open('manifest.json'))['job'])" 2>/dev/null; }
+mget() { python -c "import json,sys;m=json.load(open('manifest.json'));v=m;[v:=v[k] for k in sys.argv[1].split('.')];print(v)" "$1"; }
+# ---- setup (same assets as run.sh) ----
+( cd hb && [ -d .git ] || { git init -q && git checkout -q --orphan "hb/$ID" && git remote add origin "https://github.com/$REPO.git" && git config user.email "$ID@pool" && git config user.name "$ID"; } )
+export PATH=$HOME/.local/bin:$PATH
+which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+[ -d venv ] && ! venv/bin/python -c "import sys" >/dev/null 2>&1 && rm -rf venv
+[ -d venv ] || uv venv -q --python 3.12 venv
+source venv/bin/activate
+uv pip install -q kaggle
+[ -n "$(mf)" ] || { log 'no manifest'; exit 1; }
+JOB=$(mget job); hb setup
+if [ ! -f wh/.done ]; then
+  kaggle datasets download nicholasooo/casmi-m2-fwdsim-wheels -p wh --unzip -q
+  (cd wh && for f in *2.6.0cpu*.whl; do mv "$f" "${f/2.6.0cpu/2.6.0+cpu}"; done; for f in *pt26cpu*.whl; do mv "$f" "${f/2.1.2pt26cpu/2.1.2+pt26cpu}"; done) && touch wh/.done
+fi
+uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
+uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
+[ -f src/casmi/fwdsim/runIceberg.py ] || kaggle datasets download nicholasooo/casmi-src -p . --unzip -q
+[ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
+[ -f src/casmi/fwdsim/runIceberg.py ] || { log 'casmi package missing'; hb err; exit 1; }
+CKPT_DS=$(mget ckptDs); GEN=$(mget gen); INTEN=$(mget inten); CK=ck/${CKPT_DS#*/}
+for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kaggle datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; hb err; exit 1; }; done
+SETUP_SEC=$(( $(date +%s) - T_BOOT )); log "setup done in ${SETUP_SEC}s: $(nproc) cpus; torch $(python -c 'import torch;print(torch.__version__)')"
+printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$(mget dsPrefix)-$ID" "nicholasooo/$(mget dsPrefix)-$ID" > ds/dataset-metadata.json
+getJobs() { JOBS_DS=$(mget jobsDataset); JOBS_FILE=$(mget jobsFile); [ -f "jobs/$JOBS_FILE" ] || kaggle datasets download "$JOBS_DS" -f "$JOBS_FILE" -p jobs -q --unzip; [ -f "jobs/$JOBS_FILE" ] || { log "jobs missing $JOBS_DS/$JOBS_FILE"; return 1; }; }
+iceArgs() { echo "--gen $CK/$GEN --inten $CK/$INTEN --device cpu --threads $(mget ice.threads) --batch $(mget ice.batch) --chunk $(mget chunk) --maxNodes $(mget ice.maxNodes) --sparseK $(mget ice.sparseK)"; }
+# ---- self-test: first L jobs of the table vs manifest hash (non-blocking unless selftest.blocking) ----
+if getJobs && [ "$(mget selftest.limit 2>/dev/null)" != "" ]; then
+  rm -rf st && PYTHONPATH=src python -m casmi.fwdsim.runIceberg --jobs "jobs/$JOBS_FILE" --out st $(iceArgs) --limit "$(mget selftest.limit)" --shard 0/1 > log/selftest.log 2>&1
+  SELFTEST=$(python - <<'PY'
+import glob, hashlib, json, polars as pl
+m = json.load(open('manifest.json'))['selftest']; f = sorted(glob.glob('st/chunk*.parquet'))
+d = pl.read_parquet(f[0]).head(m['limit']) if f else None
+h = hashlib.sha1(json.dumps([[round(x, 3) for x in r] for r in d['mzs'].to_list()] + [[round(x, 3) for x in r] for r in d['intens'].to_list()]).encode()).hexdigest() if d is not None else 'none'
+print('pass' if h == m['sha1'] else 'fail')
+PY
+)
+  log "selftest $SELFTEST"; [ "$SELFTEST" = fail ] && [ "$(mget selftest.blocking)" = True ] && { hb selftestFail; exit 1; }
+fi
+hb ready
+publish() {  # $1 out dir $2 shard tag  -> version (or create) my dataset with all finished shards
+  for f in "$1"/chunk*.parquet; do ln -f "$f" "ds/${JOB}_$2_$(basename "$f")"; done; ln -f "$1/summary.json" "ds/${JOB}_$2_summary.json"
+  sleep $(( IDX * 7 % 60 ))
+  local R; R=$(kaggle datasets version -p ds -q -m "$JOB $2 $(date -u +%H:%M)" 2>&1); c429 "$R"
+  case "$R" in *rror*|*"not found"*|*404*) R=$(kaggle datasets create -p ds -q 2>&1); c429 "$R";; esac; log "publish $2: ${R: -80}"
+  case "$R" in *rror*|*"failed"*) return 1;; esac; return 0
+}
+runShard() {  # $1 shard -> 0 done, 2 paused, 3 killed, 9 killtest/die exit
+  local s=$1 S; S=$(printf 's%02d' "$s"); local OUT=out_$JOB/$S; mkdir -p "$OUT"; local N; N=$(mget N)
+  python - "$OUT" <<'PY'
+import glob, os, sys, polars as pl
+n = 0
+for f in glob.glob(sys.argv[1] + '/chunk*.parquet'):
+    try: pl.read_parquet(f); n += 1
+    except Exception: os.remove(f)
+print(f'resume: {n} finished chunks on disk')
+PY
+  local T0; T0=$(date +%s); local C0; C0=$(ls "$OUT"/chunk*.parquet 2>/dev/null | wc -l)
+  PYTHONPATH=src nohup python -m casmi.fwdsim.runIceberg --jobs "jobs/$JOBS_FILE" --out "$OUT" $(iceArgs) --shard "$s/$N" > "log/ice_${JOB}_$S.log" 2>&1 &
+  local PID=$! LASTHB; LASTHB=$(date +%s); hb running "$s" "$C0"; local ST
+  while kill -0 $PID 2>/dev/null; do
+    sleep 30 || true; local C; C=$(ls "$OUT"/chunk*.parquet 2>/dev/null | wc -l)
+    if [ "$KILLTEST$DIE" != 00 ] && [ ! -f killtest.done ] && [ "$C" -gt "$C0" ]; then
+      touch killtest.done; kill $PID 2>/dev/null; sleep 2; kill -9 $PID 2>/dev/null
+      if [ "$DIE" = 1 ]; then log "DIE: runner stopped mid-shard $s after $C chunk(s); do NOT restart"; hb died "$s" "$C"; return 9; fi
+      log "KILLTEST: runner killed mid-shard $s after $C chunk(s) — restart the same command now"; hb killtest "$s" "$C"; return 9
+    fi
+    if [ $(( $(date +%s) - LASTHB )) -ge $(( $(mget hbMin) * 60 )) ]; then RATE=$(grep -o '[0-9.]* s/job' "log/ice_${JOB}_$S.log" | tail -1 | cut -d' ' -f1); RATE=${RATE:-0}; hb running "$s" "$C"; LASTHB=$(date +%s)
+      ST=$(killState); [ "$ST" = run ] || { kill $PID 2>/dev/null; sleep 2; kill -9 $PID 2>/dev/null; [ "$ST" = pause ] && { hb paused "$s" "$C"; return 2; }; hb killed "$s" "$C"; return 3; }
+    fi
+  done
+  wait $PID; local RC=$?; RATE=$(grep -o '[0-9.]* s/job' "log/ice_${JOB}_$S.log" | tail -1 | cut -d' ' -f1); RATE=${RATE:-0}
+  python summ.py "$OUT" "$s" "$N" "$RC" "$(( $(date +%s) - T0 ))" "jobs/$JOBS_FILE" "$(mget chunk)" "$JOB"
+  local ROWS; ROWS=$(python -c "import json;print(json.load(open('$OUT/summary.json'))['rows'])"); JOBS_DONE=$(( JOBS_DONE + ROWS ))
+  hb publishing "$s" "$(ls "$OUT"/chunk*.parquet | wc -l)"
+  if publish "$OUT" "$S"; then echo "$JOB:$s" >> hb/done.txt; hb published "$s"; log "shard $s done: $ROWS rows, $(( $(date +%s) - T0 ))s"; else log "publish failed shard $s (kept on disk)"; hb err "$s"; fi
+  return 0
+}
+# ---- main loop: claim -> run -> publish; idle when nothing to claim; KILL/PAUSE honoured every chunk ----
+IDLE=0
+while :; do
+  ST=$(killState); if [ "$ST" = kill ]; then hb killed; log 'KILL: exiting'; exit 0; elif [ "$ST" = pause ]; then hb paused; log 'PAUSE'; zz 300; continue; fi
+  NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; }
+  getJobs || { hb err; zz 300; continue; }
+  read -r PICK ND NA NH <<< "$(python claim.py "$ID" "$IDX" "$T_BOOT")"; log "claim: shard $PICK (done $ND active $NA heartbeats $NH)"
+  if [ "$PICK" = -1 ]; then [ $IDLE = 0 ] && hb idle; IDLE=1; zz 300; continue; fi
+  IDLE=0; runShard "$PICK"; RC=$?
+  case $RC in 9) exit 9;; 2) zz 300;; 3) log 'KILL: exiting'; exit 0;; esac
+done
