@@ -62,5 +62,5 @@ PY
 for f in "$OUT"/*; do [ -f "$f" ] && ln -f "$f" "ds/${JOB}_${S}_$(basename "$f")"; done
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$DSPREFIX-$S" "$DS" > ds/dataset-metadata.json
 R=$(kg datasets create -p ds -q); case "$R" in *rror*|*exists*|*already*) R=$(kg datasets version -p ds -q -m "$JOB $S $(date -u +%H:%M)");; esac; log "publish: ${R: -100}"
-for w in 60 60 90 120 150 180; do sleep $w; kg datasets files "$DS" | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done   # 6 API calls per shard (shared account budget)
+for w in 60 60 90 120 150 180; do sleep $w; kg datasets files "$DS" --page-size 500 | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done   # 6 API calls per shard (shared account budget)
 log "dataset NOT verified after 11 min: $DS"; echo "DONE (upload unverified) rc=$RC"; exit 1
