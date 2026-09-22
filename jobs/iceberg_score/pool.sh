@@ -2,10 +2,11 @@
 # C1 pool worker (swarm100 protocol, casmi2026-gold docs/plans/swarm100_pool.md): autonomous ICEBERG CPU scoring of shards claimed from pool/manifest.json.
 # env: ID=p00 IDX=0 KAGGLE_API_TOKEN GH_TOKEN  [KILLTEST=1: self-kill after first chunk of first shard, restart expected (resume test)]  [DIE=1: stop after first chunk, no restart (stale test)]
 # reads casmi-compute main: pool/manifest.json, pool/KILL (raw, <=5 min cache); heartbeat = branch hb/<ID> file hb.json (fetched at each claim for done/stale detection).
-# writes private dataset nicholasooo/<dsPrefix>-<ID>: <job>_s<NN>_chunk*.parquet + <job>_s<NN>_summary.json, one version per finished shard (no checkpoints).
+# writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
+# manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
-REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool
+REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
 KILLTEST=${KILLTEST:-0}; DIE=${DIE:-0}; T_BOOT=$(date +%s); ERR429=0; JOBS_DONE=0; SETUP_SEC=0; SELFTEST=none; JOB=none; RATE=0
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
@@ -64,22 +65,66 @@ print(lose)
 PY
 cat > summ.py <<'PY'
 import glob, json, sys, polars as pl
-out, shard, n, rc, wall, jobs, chunk, job = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6], int(sys.argv[7]), sys.argv[8]
-total = pl.scan_parquet(jobs).select(pl.len()).collect().item(); nChunks = (total + chunk - 1) // chunk; mine = len(range(shard, nChunks, n))
+import os
+out, shard, n, rc, wall, module, chunk, job = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6], int(sys.argv[7]), sys.argv[8]
 files = sorted(glob.glob(out + '/chunk*.parquet')); df = pl.concat([pl.read_parquet(f) for f in files]) if files else None
-rows = df.height if df is not None else 0; empty = int((df['mzs'].list.len() == 0).sum()) if df is not None else 0
-s = {'job': job, 'shard': f'{shard}/{n}', 'rc': rc, 'chunksDone': len(files), 'chunksExpected': mine, 'complete': len(files) == mine and rc == 0, 'rows': rows, 'emptyPredictions': empty, 'secPerJob': round(float(df['seconds'].mean()), 4) if df is not None else None, 'wallSec': wall}
-json.dump(s, open(out + '/summary.json', 'w'), indent=1); print('summary:', json.dumps(s))
+rows = df.height if df is not None else 0; empty = int((df['mzs'].list.len() == 0).sum()) if df is not None and 'mzs' in df.columns else None
+ms = json.load(open(out + '/summary.json')) if os.path.exists(out + '/summary.json') else None   # module's own summary (runShard) is kept as is
+s = {'job': job, 'shard': f'{shard}/{n}', 'module': module, 'rc': rc, 'chunksDone': len(files), 'complete': rc == 0 and (ms is None or bool(ms.get('pass', True))), 'rows': rows, 'emptyPredictions': empty,
+     'secPerJob': round(float(df['seconds'].mean()), 4) if df is not None and 'seconds' in df.columns else None, 'wallSec': wall, 'moduleSummary': ms, 'files': sorted(os.path.basename(f) for f in glob.glob(out + '/*') if not f.endswith('pool_summary.json'))}
+json.dump(s, open(out + '/pool_summary.json', 'w'), indent=1); print('summary:', json.dumps(s)[:600])
+PY
+cat > adapt.py <<'PY'
+# adapt a job table to ICE columns: settings struct/json -> adductIce/ceEv/instrumentIce; jobId (if present) -> ik14 so outputs are keyed by jobId
+import os, sys, polars as pl
+src, dst = sys.argv[1], sys.argv[2]
+if os.path.exists(dst): sys.exit(0)
+j = pl.read_parquet(src)
+if 'settings' in j.columns and 'adductIce' not in j.columns:
+    if j['settings'].dtype == pl.Utf8: j = j.with_columns(pl.col('settings').str.json_decode())
+    j = j.unnest('settings')
+if 'jobId' in j.columns: j = j.with_columns(pl.col('jobId').cast(pl.Utf8).alias('ik14'))
+need = ['ik14', 'smiles', 'adductIce', 'ceEv', 'instrumentIce']; miss = [c for c in need if c not in j.columns]
+if miss: print('jobs table missing columns', miss); sys.exit(1)
+j.with_columns(pl.col('adductIce').cast(pl.Utf8), pl.col('ceEv').cast(pl.Float64), pl.col('instrumentIce').cast(pl.Utf8)).select(need).write_parquet(dst)
+PY
+cat > stprep.py <<'PY'
+# self-test job table: selftest.json {jobs:[...]} (argv1) or head(limit) of a jobs file (argv2, argv3)
+import json, sys, polars as pl
+stf, jf, lim = sys.argv[1], sys.argv[2], int(sys.argv[3]); st = json.load(open(stf)) if stf else {}
+(pl.DataFrame(st['jobs']) if st.get('jobs') else pl.read_parquet(jf).head(lim)).write_parquet('st_raw.parquet')
+PY
+cat > stcmp.py <<'PY'
+# compare self-test predictions with expected values -> "pass|fail <maxAbsDiff> <nCompared>"
+import glob, hashlib, json, sys, polars as pl
+mf = json.load(open('manifest.json'))['selftest']; stf, ef = sys.argv[1], sys.argv[2]; st = json.load(open(stf)) if stf else {}
+exp = st.get('expected') if st else (json.load(open(ef)) if ef else None); tol = float(st.get('tol', mf.get('tol', 1e-6)))
+f = sorted(glob.glob('st/chunk*.parquet')); d = pl.concat([pl.read_parquet(x) for x in f]) if f else None
+if d is None or d.height == 0: print('fail noOutput 0'); sys.exit(0)
+if exp is None:
+    h = hashlib.sha1(json.dumps([[round(x, 3) for x in r] for r in d['mzs'].to_list()] + [[round(x, 3) for x in r] for r in d['intens'].to_list()]).encode()).hexdigest()
+    print('pass' if h == mf.get('sha1') else 'fail', 'sha1', d.height); sys.exit(0)
+if isinstance(exp, list): exp = {str(i): e for i, e in enumerate(exp)}
+keyed = bool(st.get('jobs')) and 'jobId' in st['jobs'][0]
+md, n = 0.0, 0
+for i, r in enumerate(d.iter_rows(named=True)):
+    e = exp.get(str(r['ik14'])) if keyed else exp.get(str(i))
+    if e is None: continue
+    n += 1
+    for a, b in ((r['mzs'], e['mzs']), (r['intens'], e['intens'])):
+        if len(a) != len(b): md = float('inf'); continue
+        for p, q in zip(a, b): md = max(md, abs(float(p) - float(q)))
+print('pass' if (n > 0 and md <= tol) else 'fail', md, n)
 PY
 hb() {  # status [shard] [chunksDone]
   python hbw.py "$ID" "$IDX" "$JOB" "$1" "${2:--}" "${3:-0}" "$JOBS_DONE" "$RATE" "$ERR429" "$SETUP_SEC" "$SELFTEST" "$KILLTEST$DIE" > hb/hb.json 2>/dev/null || return 0
   ( cd hb && git add hb.json && { git commit -q --amend -m "hb $ID" >/dev/null 2>&1 || git commit -q -m "hb $ID" >/dev/null 2>&1; } && gitc push -qf origin "HEAD:refs/heads/hb/$ID" >/dev/null 2>&1 ) || log "hb push failed"
 }
 killState() {  # run | pause | kill  (pool/KILL on main: empty=run, PAUSE|KILL [id] per line)
-  local k; k=$(curl -sf --max-time 20 "$RAW/KILL" 2>/dev/null || true); local st=run
+  local k; k=$(curl -sf --max-time 20 "$KILL_URL" 2>/dev/null || true); local st=run
   while read -r a b; do [ -z "$a" ] && continue; [ -n "$b" ] && [ "$b" != "$ID" ] && continue; case "$a" in KILL) st=kill;; PAUSE) [ "$st" = kill ] || st=pause;; esac; done <<< "$k"; echo $st
 }
-mf() { curl -sf --max-time 20 "$RAW/manifest.json" -o manifest.new && mv manifest.new manifest.json || log "manifest fetch failed"; python -c "import json;print(json.load(open('manifest.json'))['job'])" 2>/dev/null; }
+mf() { curl -sf --max-time 20 "$MANIFEST_URL" -o manifest.new && mv manifest.new manifest.json || log "manifest fetch failed"; python -c "import json;print(json.load(open('manifest.json'))['job'])" 2>/dev/null; }
 mget() { python -c "import json,sys;m=json.load(open('manifest.json'));v=m;[v:=v[k] for k in sys.argv[1].split('.')];print(v)" "$1"; }
 # ---- setup (same assets as run.sh) ----
 ( cd hb && [ -d .git ] || { git init -q && git checkout -q --orphan "hb/$ID" && git remote add origin "https://github.com/$REPO.git" && git config user.email "$ID@pool" && git config user.name "$ID"; } )
@@ -97,6 +142,8 @@ if [ ! -f wh/.done ]; then
 fi
 uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
 uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
+WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1)
+[ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "casmi-src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
 [ -f src/casmi/fwdsim/runIceberg.py ] || kaggle datasets download nicholasooo/casmi-src -p . --unzip -q
 [ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
 [ -f src/casmi/fwdsim/runIceberg.py ] || { log 'casmi package missing'; hb err; exit 1; }
@@ -104,24 +151,28 @@ CKPT_DS=$(mget ckptDs); GEN=$(mget gen); INTEN=$(mget inten); CK=ck/${CKPT_DS#*/
 for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kaggle datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; hb err; exit 1; }; done
 SETUP_SEC=$(( $(date +%s) - T_BOOT )); log "setup done in ${SETUP_SEC}s: $(nproc) cpus; torch $(python -c 'import torch;print(torch.__version__)')"
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$(mget dsPrefix)-$ID" "nicholasooo/$(mget dsPrefix)-$ID" > ds/dataset-metadata.json
-getJobs() { JOBS_DS=$(mget jobsDataset); JOBS_FILE=$(mget jobsFile); [ -f "jobs/$JOBS_FILE" ] || kaggle datasets download "$JOBS_DS" -f "$JOBS_FILE" -p jobs -q --unzip; [ -f "jobs/$JOBS_FILE" ] || { log "jobs missing $JOBS_DS/$JOBS_FILE"; return 1; }; }
+getJobs() {  # download every input of the manifest from jobsDataset (once per job), adapt the ICE job table if the module is runIceberg
+  JOBS_DS=$(mget jobsDataset); JOBS_FILE=$(mget jobsFile 2>/dev/null); local f
+  for f in $(python -c "import json;m=json.load(open('manifest.json'));print(' '.join(m.get('inputs') or [m['jobsFile']]))"); do
+    [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "input missing $JOBS_DS/$f"; return 1; }
+  done
+  MODULE=$(mget module 2>/dev/null); MODULE=${MODULE:-casmi.fwdsim.runIceberg}; MARGS=$(mget args 2>/dev/null)
+  if [ "$MODULE" = casmi.fwdsim.runIceberg ]; then python adapt.py "jobs/$JOBS_FILE" "jobs/ice_$JOBS_FILE" || return 1; MARGS="${MARGS:---jobs jobs/ice_$JOBS_FILE}"; fi
+}
 iceArgs() { echo "--gen $CK/$GEN --inten $CK/$INTEN --device cpu --threads $(mget ice.threads) --batch $(mget ice.batch) --chunk $(mget chunk) --maxNodes $(mget ice.maxNodes) --sparseK $(mget ice.sparseK)"; }
-# ---- self-test: first L jobs of the table vs manifest hash (non-blocking unless selftest.blocking) ----
-if getJobs && [ "$(mget selftest.limit 2>/dev/null)" != "" ]; then
-  rm -rf st && PYTHONPATH=src python -m casmi.fwdsim.runIceberg --jobs "jobs/$JOBS_FILE" --out st $(iceArgs) --limit "$(mget selftest.limit)" --shard 0/1 > log/selftest.log 2>&1
-  SELFTEST=$(python - <<'PY'
-import glob, hashlib, json, polars as pl
-m = json.load(open('manifest.json'))['selftest']; f = sorted(glob.glob('st/chunk*.parquet'))
-d = pl.read_parquet(f[0]).head(m['limit']) if f else None
-h = hashlib.sha1(json.dumps([[round(x, 3) for x in r] for r in d['mzs'].to_list()] + [[round(x, 3) for x in r] for r in d['intens'].to_list()]).encode()).hexdigest() if d is not None else 'none'
-print('pass' if h == m['sha1'] else 'fail')
-PY
-)
-  log "selftest $SELFTEST"; [ "$SELFTEST" = fail ] && [ "$(mget selftest.blocking)" = True ] && { hb selftestFail; exit 1; }
-fi
+selftest() {  # 8 known-answer ICE jobs; SELFTEST=pass|fail|none; a worker never claims while fail
+  SELFTEST=none; local F JF EF L f; F=$(mget selftest.file 2>/dev/null); JF=$(mget selftest.jobsFile 2>/dev/null); EF=$(mget selftest.expectedFile 2>/dev/null); L=$(mget selftest.limit 2>/dev/null)
+  [ -z "$F$JF$L" ] && return 0
+  [ -n "$F$JF" ] || JF=$JOBS_FILE   # legacy: first L jobs of the job table, sha1 of rounded values
+  for f in $F $JF $EF; do [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "selftest input missing $f"; SELFTEST=fail; return; }; done
+  rm -f st_raw.parquet st_jobs.parquet; python stprep.py "${F:+jobs/$F}" "${JF:+jobs/$JF}" "${L:-8}" && python adapt.py st_raw.parquet st_jobs.parquet || { SELFTEST=fail; log 'selftest prep failed'; return; }
+  rm -rf st && PYTHONPATH=src python -m casmi.fwdsim.runIceberg --jobs st_jobs.parquet --out st $(iceArgs) --shard 0/1 > log/selftest.log 2>&1
+  read -r SELFTEST STD STN <<< "$(python stcmp.py "${F:+jobs/$F}" "${EF:+jobs/$EF}" 2>>log/selftest.log | tail -1)"; SELFTEST=${SELFTEST:-fail}; log "selftest $SELFTEST maxAbsDiff ${STD:-?} jobs ${STN:-0} tol $(mget selftest.tol 2>/dev/null || echo 1e-6)"
+}
+getJobs && selftest; ST_JOB=$JOB
 hb ready
 publish() {  # $1 out dir $2 shard tag  -> version (or create) my dataset with all finished shards
-  for f in "$1"/chunk*.parquet; do ln -f "$f" "ds/${JOB}_$2_$(basename "$f")"; done; ln -f "$1/summary.json" "ds/${JOB}_$2_summary.json"
+  for f in "$1"/*; do [ -f "$f" ] && ln -f "$f" "ds/${JOB}_$2_$(basename "$f")"; done
   sleep $(( IDX * 7 % 60 ))
   local R; R=$(kaggle datasets version -p ds -q -m "$JOB $2 $(date -u +%H:%M)" 2>&1); c429 "$R"
   case "$R" in *rror*|*"not found"*|*404*) R=$(kaggle datasets create -p ds -q 2>&1); c429 "$R";; esac; log "publish $2: ${R: -80}"
@@ -138,7 +189,7 @@ for f in glob.glob(sys.argv[1] + '/chunk*.parquet'):
 print(f'resume: {n} finished chunks on disk')
 PY
   local T0; T0=$(date +%s); local C0; C0=$(ls "$OUT"/chunk*.parquet 2>/dev/null | wc -l)
-  PYTHONPATH=src nohup python -m casmi.fwdsim.runIceberg --jobs "jobs/$JOBS_FILE" --out "$OUT" $(iceArgs) --shard "$s/$N" > "log/ice_${JOB}_$S.log" 2>&1 &
+  PYTHONPATH=src nohup python -m "$MODULE" $MARGS --out "$OUT" $(iceArgs) --shard "$s/$N" > "log/ice_${JOB}_$S.log" 2>&1 &
   local PID=$! LASTHB; LASTHB=$(date +%s); hb running "$s" "$C0"; local ST
   sleep $(( 15 + RANDOM % 30 )); if [ "$(python conflict.py "$ID" "$IDX" "$s" "$JOB" 2>>log/conflict.log)" = 1 ]; then kill $PID 2>/dev/null; sleep 2; kill -9 $PID 2>/dev/null; log "shard $s: claimed earlier by another worker, backing off"; hb ready; return 4; fi
   while kill -0 $PID 2>/dev/null; do
@@ -153,8 +204,8 @@ PY
     fi
   done
   wait $PID; local RC=$?; RATE=$(grep -o '[0-9.]* s/job' "log/ice_${JOB}_$S.log" | tail -1 | cut -d' ' -f1); RATE=${RATE:-0}
-  python summ.py "$OUT" "$s" "$N" "$RC" "$(( $(date +%s) - T0 ))" "jobs/$JOBS_FILE" "$(mget chunk)" "$JOB"
-  local ROWS; ROWS=$(python -c "import json;print(json.load(open('$OUT/summary.json'))['rows'])"); JOBS_DONE=$(( JOBS_DONE + ROWS ))
+  python summ.py "$OUT" "$s" "$N" "$RC" "$(( $(date +%s) - T0 ))" "${MODULE##*.}" "$(mget chunk)" "$JOB"
+  local ROWS; ROWS=$(python -c "import json;print(json.load(open('$OUT/pool_summary.json'))['rows'])"); JOBS_DONE=$(( JOBS_DONE + ROWS ))
   hb publishing "$s" "$(ls "$OUT"/chunk*.parquet | wc -l)"
   if publish "$OUT" "$S"; then echo "$JOB:$s" >> hb/done.txt; hb published "$s"; log "shard $s done: $ROWS rows, $(( $(date +%s) - T0 ))s"; else log "publish failed shard $s (kept on disk)"; hb err "$s"; fi
   return 0
@@ -165,6 +216,8 @@ while :; do
   ST=$(killState); if [ "$ST" = kill ]; then hb killed; log 'KILL: exiting'; exit 0; elif [ "$ST" = pause ]; then hb paused; log 'PAUSE'; zz 300; continue; fi
   NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; }
   getJobs || { hb err; zz 300; continue; }
+  [ "$ST_JOB" = "$JOB" ] || { selftest; ST_JOB=$JOB; }
+  [ "$SELFTEST" = fail ] && { log 'selftest failed: refusing to claim'; hb selftestFail; zz 600; ST_JOB=; continue; }
   read -r PICK ND NA NH <<< "$(python claim.py "$ID" "$IDX" "$T_BOOT" 2>&1 | tail -1)"; log "claim: shard $PICK (done $ND active $NA heartbeats $NH)"
   [[ "$PICK" =~ ^-?[0-9]+$ ]] || { log 'claim failed'; hb err; zz 120; continue; }
   if [ "$PICK" = -1 ]; then hb idle; IDLE=1; zz 300; continue; fi
