@@ -24,7 +24,7 @@ PY
 cat > claim.py <<'PY'
 import json, subprocess, sys, time
 id_, idx, boot = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]); mf = json.load(open('manifest.json'))
-job, N, W, stale, grace = mf['job'], int(mf['N']), int(mf['W']), float(mf.get('staleMin', 30)), float(mf.get('graceMin', 20))
+job, N, W, stale, grace, steal = mf['job'], int(mf['N']), int(mf['W']), float(mf.get('staleMin', 30)), float(mf.get('graceMin', 20)), mf.get('steal', 'stale')
 def git(*a): return subprocess.run(['git', *a], cwd='hb', capture_output=True, text=True).stdout
 git('fetch', '-q', '-p', 'origin', '+refs/heads/hb/*:refs/remotes/hb/*')
 hbs = []
@@ -45,9 +45,22 @@ def stealable(s):
     o = byIdx.get(s % W)
     if not o: return now - boot > grace * 60   # owner never heartbeated
     h = max(o, key=lambda x: x.get('ts', 0))
-    return h.get('status') in ('idle', 'killed', 'err', 'selftestFail') or now - h.get('ts', 0) > stale * 60 or h.get('job') != job
+    if h.get('status') in ('idle', 'killed', 'err', 'selftestFail') or now - h.get('ts', 0) > stale * 60 or h.get('job') != job: return True
+    return steal == 'any' and h.get('status') == 'running' and h.get('shard') != s   # owner busy elsewhere: take its pending shard (highest first)
 rest = [s for s in range(N - 1, -1, -1) if stealable(s)]
 print(own[0] if own else (rest[0] if rest else -1), len(done), len(active), len(hbs))
+PY
+cat > conflict.py <<'PY'
+import json, subprocess, sys, time
+id_, idx, shard, job = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]; mine = json.load(open('hb/hb.json'))['ts']
+def git(*a): return subprocess.run(['git', *a], cwd='hb', capture_output=True, text=True).stdout
+git('fetch', '-q', '-p', 'origin', '+refs/heads/hb/*:refs/remotes/hb/*'); now = time.time(); lose = 0
+for r in git('for-each-ref', '--format=%(refname)', 'refs/remotes/hb/').split():
+    try: h = json.loads(git('show', f'{r}:hb.json'))
+    except Exception: continue
+    if h.get('id') == id_ or h.get('job') != job or h.get('shard') != shard or h.get('status') not in ('running', 'publishing') or now - h.get('ts', 0) > 900: continue
+    if h['ts'] < mine - 1 or (abs(h['ts'] - mine) <= 1 and h.get('idx', 99) < idx): lose = 1; print(f"conflict: {h['id']} announced shard {shard} first", file=sys.stderr)
+print(lose)
 PY
 cat > summ.py <<'PY'
 import glob, json, sys, polars as pl
@@ -127,6 +140,7 @@ PY
   local T0; T0=$(date +%s); local C0; C0=$(ls "$OUT"/chunk*.parquet 2>/dev/null | wc -l)
   PYTHONPATH=src nohup python -m casmi.fwdsim.runIceberg --jobs "jobs/$JOBS_FILE" --out "$OUT" $(iceArgs) --shard "$s/$N" > "log/ice_${JOB}_$S.log" 2>&1 &
   local PID=$! LASTHB; LASTHB=$(date +%s); hb running "$s" "$C0"; local ST
+  sleep $(( 15 + RANDOM % 30 )); if [ "$(python conflict.py "$ID" "$IDX" "$s" "$JOB" 2>>log/conflict.log)" = 1 ]; then kill $PID 2>/dev/null; sleep 2; kill -9 $PID 2>/dev/null; log "shard $s: claimed earlier by another worker, backing off"; hb ready; return 4; fi
   while kill -0 $PID 2>/dev/null; do
     sleep 30 || true; local C; C=$(ls "$OUT"/chunk*.parquet 2>/dev/null | wc -l)
     if [ "$KILLTEST$DIE" != 00 ] && [ ! -f killtest.done ] && [ "$C" -gt "$C0" ]; then
@@ -155,5 +169,5 @@ while :; do
   [[ "$PICK" =~ ^-?[0-9]+$ ]] || { log 'claim failed'; hb err; zz 120; continue; }
   if [ "$PICK" = -1 ]; then hb idle; IDLE=1; zz 300; continue; fi
   IDLE=0; runShard "$PICK"; RC=$?
-  case $RC in 9) exit 9;; 2) zz 300;; 3) log 'KILL: exiting'; exit 0;; esac
+  case $RC in 9) exit 9;; 2) zz 300;; 3) log 'KILL: exiting'; exit 0;; 4) zz 30;; esac
 done
