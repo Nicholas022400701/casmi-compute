@@ -14,6 +14,7 @@ mkdir -p "$ROOT" "$OUT" && cd "$ROOT"
 log "inputs under $IN:"; find "$IN" -maxdepth 3 2>/dev/null | head -60; nproc; free -g | head -2; python3 --version 2>/dev/null
 # ---- setup: with internet -> python 3.12 venv + full ICE wheel set (as pool.sh); without -> Kaggle stock python/torch + wheels only (compat shims for torch_scatter/pygmtools) ----
 NET=0; curl -sI --max-time 8 https://pypi.org >/dev/null 2>&1 && NET=1; log "internet: $NET"
+for i in $(seq 1 12); do [ -n "$(ls "$IN"/casmi-m2-fwdsim-wheels/*.whl 2>/dev/null)" ] && [ -d "$IN/casmi-c1-pool-jobs/$SRC_DIR" ] && [ -d "$IN/$JOBS_DS" ] && break; log "waiting for input mounts ($i)"; sleep 10; done
 mkdir -p wh; [ -f wh/.done ] || { cp "$IN"/casmi-m2-fwdsim-wheels/*.whl wh/ && (cd wh && for f in *2.6.0cpu*.whl; do [ -f "$f" ] && mv "$f" "${f/2.6.0cpu/2.6.0+cpu}"; done; for f in *pt26cpu*.whl; do [ -f "$f" ] && mv "$f" "${f/2.1.2pt26cpu/2.1.2+pt26cpu}"; done; true) && touch wh/.done; }
 PY=python3   # Kaggle stock python 3.12: install the pool's exact ICE wheel set (torch 2.6.0+cpu, dgl, torch_scatter, ms_pred, rdkit...) over the stock packages
 [ "$NET" = 1 ] && $PY -m pip install -q sympy==1.13.1 einops polars pyarrow 2>&1 | grep -v -i 'wrapt\|sitecustomize' | tail -2
