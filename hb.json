@@ -1,1 +1,1 @@
-{"id": "f3-mlp1k", "idx": 3, "status": "running", "shard": 3, "chunk": 7, "jobsDone": 30291, "rate": 2078.5, "err429": 0, "setupSec": 17, "selftest": "ok", "done": false, "ts": 1790053893.1959748, "arch": "mlp1k", "x": 0.9}
+{"id": "f3-mlp1k", "idx": 3, "status": "running", "shard": 3, "chunk": 8, "jobsDone": 35404, "rate": 2080.7, "err429": 0, "setupSec": 17, "selftest": "ok", "done": false, "ts": 1790054518.251654, "arch": "mlp1k", "x": 0.9}
