@@ -149,7 +149,8 @@ while :; do
   ST=$(killState); if [ "$ST" = kill ]; then hb killed; log 'KILL: exiting'; exit 0; elif [ "$ST" = pause ]; then hb paused; log 'PAUSE'; zz 300; continue; fi
   NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; }
   getJobs || { hb err; zz 300; continue; }
-  read -r PICK ND NA NH <<< "$(python claim.py "$ID" "$IDX" "$T_BOOT")"; log "claim: shard $PICK (done $ND active $NA heartbeats $NH)"
+  read -r PICK ND NA NH <<< "$(python claim.py "$ID" "$IDX" "$T_BOOT" 2>&1 | tail -1)"; log "claim: shard $PICK (done $ND active $NA heartbeats $NH)"
+  [[ "$PICK" =~ ^-?[0-9]+$ ]] || { log 'claim failed'; hb err; zz 120; continue; }
   if [ "$PICK" = -1 ]; then [ $IDLE = 0 ] && hb idle; IDLE=1; zz 300; continue; fi
   IDLE=0; runShard "$PICK"; RC=$?
   case $RC in 9) exit 9;; 2) zz 300;; 3) log 'KILL: exiting'; exit 0;; esac
