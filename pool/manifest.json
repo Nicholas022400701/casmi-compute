@@ -38,7 +38,7 @@
  "note": "src pinned to main 4a3d6d5 (E1b re-cut; includes e4d436e shard-column rule: mass-contiguous job-balanced shards, N=100); job table casmi-m2-ranker-jobs v2; 1,386,912 predictions",
  "srcDataset": "nicholasooo/casmi-c1-pool-jobs",
  "srcDir": "src_4a3d6d5",
- "poolVer": 8,
- "poolUrl": "https://raw.githubusercontent.com/Nicholas022400701/casmi-compute/2480338/jobs/iceberg_score/pool.sh",
+ "poolVer": 9,
+ "poolUrl": "https://raw.githubusercontent.com/Nicholas022400701/casmi-compute/3948dfa/jobs/iceberg_score/pool.sh",
  "idPattern": "^p\\d+$"
 }
