@@ -11,6 +11,7 @@ IN=${IN:-/kaggle/input}; OUT=${OUT:-/kaggle/working/out}; ROOT=${ROOT:-/kaggle/w
 GEN=iceberg_msg_all/gen/best.ckpt; INTEN=iceberg_msg_all/inten_contr/best.ckpt; CK=$IN/casmi-m2-fwdsim-assets
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 mkdir -p "$ROOT" "$OUT" && cd "$ROOT"
+log "inputs under $IN:"; find "$IN" -maxdepth 3 2>/dev/null | head -60; nproc; free -g | head -2; python3 --version 2>/dev/null
 # ---- setup: python 3.12 venv + ICE wheels (same as pool.sh) ----
 export PATH=$HOME/.local/bin:$PATH
 which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
