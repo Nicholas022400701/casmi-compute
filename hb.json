@@ -1,0 +1,1 @@
+{"id": "f0-mlp1k-x07", "idx": 1, "status": "running", "shard": 0, "chunk": 0, "jobsDone": 0, "rate": 0, "err429": 0, "setupSec": 14, "selftest": "ok", "done": false, "ts": 1790080320.9336402, "arch": "mlp1k", "x": 0.7}
