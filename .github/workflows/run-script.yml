@@ -1,0 +1,65 @@
+# Generic CPU job runner: a private Kaggle "bundle" dataset (run.sh + inputs) is fetched, `bash run.sh` runs once per shard with SHARD/N/PROCS (+ extra env),
+# each shard's output dir is encrypted (aes-256-cbc, repo secret) into an artifact, and a final collect job publishes ALL shards into ONE private Kaggle dataset.
+# The script must need no secrets and print counts/timings only (its log is filtered anyway). Account-wide cap: 40 concurrent jobs across all workflows.
+name: run-script
+on:
+  workflow_dispatch:
+    inputs:
+      bundleDs: {description: 'private Kaggle dataset with run.sh + inputs', required: true}
+      outDs:    {description: 'output dataset slug -> nicholasooo/<outDs> (ONE dataset for all shards)', required: true}
+      shards:   {description: 'JSON list of shard ids passed as SHARD, e.g. [0,1,2,3,4,5,6,7]', required: true, default: '[0]'}
+      n:        {description: 'passed as N', required: true, default: '1'}
+      envx:     {description: 'extra env for the script, space-separated KEY=VALUE (e.g. PART=1)', required: false, default: ''}
+      procs:    {description: 'passed as PROCS (empty = nproc)', required: false, default: ''}
+      cmd:      {description: 'command run inside the bundle dir', required: false, default: 'bash run.sh'}
+      outDir:   {description: 'output dir the script writes (relative to bundle dir)', required: false, default: 'out'}
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    name: shard ${{ matrix.shard }}
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      CASMI_ENC_KEY: ${{ secrets.CASMI_ENC_KEY }}
+      BUNDLE_DS: ${{ inputs.bundleDs }}
+      SHARD: ${{ matrix.shard }}
+      N: ${{ inputs.n }}
+      ENVX: ${{ inputs.envx }}
+      PROCS: ${{ inputs.procs }}
+      CMD: ${{ inputs.cmd }}
+      OUT_DIR: ${{ inputs.outDir }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: run shard
+        run: bash jobs/run_script/shard.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enc-s${{ matrix.shard }}
+          path: ${{ runner.temp }}/rs/art/
+          retention-days: 2
+          if-no-files-found: ignore
+  collect:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      CASMI_ENC_KEY: ${{ secrets.CASMI_ENC_KEY }}
+      OUT_DS: ${{ inputs.outDs }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: enc-s*
+          path: art
+      - name: publish one dataset
+        run: bash jobs/run_script/collect.sh

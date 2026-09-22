@@ -1,7 +1,7 @@
 # ICEBERG CPU scoring of a sharded job table (private Kaggle dataset) -> one private Kaggle dataset per shard (nicholasooo/<dsprefix>-sNN).
 # One matrix job per shard, each running jobs/iceberg_score/shard.sh (same module, pinned source snapshot, checkpoints, md5-verified inputs
 # and output layout as the sandbox pool's pool.sh / kernel kpool.sh, so downstream compare/merge does not care about the source).
-# Logs print counts and timings only — never SMILES, keys or tokens. Account-wide cap: 20 concurrent jobs across all workflows.
+# Logs print counts and timings only — never SMILES, keys or tokens. Account-wide cap (GitHub Pro): 40 concurrent jobs across all workflows.
 name: iceberg-score
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false
-      max-parallel: 20
+      max-parallel: 40
       matrix:
         shard: ${{ fromJSON(inputs.shards) }}
     name: shard ${{ matrix.shard }}
