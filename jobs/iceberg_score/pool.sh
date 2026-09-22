@@ -5,7 +5,7 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
-POOL_VER=9   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
+POOL_VER=10   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
 REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}; PAUSE_IDS_URL=${PAUSE_IDS_URL:-$RAW/PAUSE_ids}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
@@ -232,8 +232,9 @@ PY
 IDLE=0
 while :; do
   ST=$(killState); if [ "$ST" = kill ]; then hb killed; log 'KILL: exiting'; exit 0; elif [ "$ST" = pause ]; then hb paused; log 'PAUSE'; zz 300; continue; fi
+  NEWJOB=$(mf)   # refresh manifest first so the version check below sees the current poolVer (was one shard late)
   PV=$(mget poolVer 2>/dev/null); if [ -n "$PV" ] && [ "$PV" != "$POOL_VER" ]; then PU=$(mget poolUrl 2>/dev/null); curl -sSfL --max-time 60 "$PU" -o pool.new && bash -n pool.new && { log "self-update poolVer $POOL_VER -> $PV"; mv -f pool.new pool.sh; exec bash pool.sh; }; log 'self-update failed'; fi
-  NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; ensureSrc || { zz 300; continue; }; }
+  [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; ensureSrc || { zz 300; continue; }; }
   getJobs || { hb err; zz 300; continue; }
   [ "$ST_JOB" = "$JOB" ] || { selftest; ST_JOB=$JOB; }
   [ "$SELFTEST" = fail ] && { log 'selftest failed: refusing to claim'; hb selftestFail; zz 600; ST_JOB=; continue; }
