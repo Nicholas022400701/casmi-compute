@@ -121,10 +121,10 @@ hb() {  # status [shard] [chunksDone]
   ( cd hb && git add hb.json && { git commit -q --amend -m "hb $ID" >/dev/null 2>&1 || git commit -q -m "hb $ID" >/dev/null 2>&1; } && gitc push -qf origin "HEAD:refs/heads/hb/$ID" >/dev/null 2>&1 ) || log "hb push failed"
 }
 killState() {  # run | pause | kill  (pool/KILL on main: empty=run, PAUSE|KILL [id] per line)
-  local k; k=$(curl -sf --max-time 20 "$KILL_URL" 2>/dev/null || true); local st=run
+  local k; k=$(curl -sf --max-time 20 "$KILL_URL?t=$(date +%s)" 2>/dev/null || true); local st=run
   while read -r a b; do [ -z "$a" ] && continue; [ -n "$b" ] && [ "$b" != "$ID" ] && continue; case "$a" in KILL) st=kill;; PAUSE) [ "$st" = kill ] || st=pause;; esac; done <<< "$k"; echo $st
 }
-mf() { curl -sf --max-time 20 "$MANIFEST_URL" -o manifest.new && mv manifest.new manifest.json || log "manifest fetch failed"; python -c "import json;print(json.load(open('manifest.json'))['job'])" 2>/dev/null; }
+mf() { curl -sf --max-time 20 "$MANIFEST_URL?t=$(date +%s)" -o manifest.new && mv manifest.new manifest.json || log "manifest fetch failed"; python -c "import json;print(json.load(open('manifest.json'))['job'])" 2>/dev/null; }
 mget() { python -c "import json,sys;m=json.load(open('manifest.json'));v=m;[v:=v[k] for k in sys.argv[1].split('.')];print(v)" "$1"; }
 # ---- setup (same assets as run.sh) ----
 ( cd hb && [ -d .git ] || { git init -q && git checkout -q --orphan "hb/$ID" && git remote add origin "https://github.com/$REPO.git" && git config user.email "$ID@pool" && git config user.name "$ID"; } )
@@ -142,12 +142,15 @@ if [ ! -f wh/.done ]; then
 fi
 uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
 uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
-WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1 | cut -d' ' -f1)
-[ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
-SRC_DS=$(mget srcDataset 2>/dev/null); SRC_FILE=$(mget srcFile 2>/dev/null)   # pinned snapshot (zip with src/ + src/COMMIT.txt) beats the floating casmi-src dataset
-[ -f src/casmi/fwdsim/runIceberg.py ] || { if [ -n "$SRC_FILE" ]; then kaggle datasets download "$SRC_DS" -f "$SRC_FILE" -p . -q --unzip && rm -f "$SRC_FILE"; else kaggle datasets download nicholasooo/casmi-src -p . --unzip -q; fi; }
-[ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
-[ -f src/casmi/fwdsim/runIceberg.py ] || { log 'casmi package missing'; hb err; exit 1; }
+ensureSrc() {  # pinned snapshot (manifest srcDataset/srcFile: zip with src/ + src/COMMIT.txt) or floating casmi-src; refreshed when COMMIT differs from manifest srcCommit
+  local WANT HAVE SRC_DS SRC_FILE; WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1 | cut -d' ' -f1)
+  [ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
+  SRC_DS=$(mget srcDataset 2>/dev/null); SRC_FILE=$(mget srcFile 2>/dev/null)
+  [ -f src/casmi/fwdsim/runIceberg.py ] || { if [ -n "$SRC_FILE" ]; then kaggle datasets download "$SRC_DS" -f "$SRC_FILE" -p . -q --unzip && rm -f "$SRC_FILE"; else kaggle datasets download nicholasooo/casmi-src -p . --unzip -q; fi; }
+  [ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
+  [ -f src/casmi/fwdsim/runIceberg.py ] || { log 'casmi package missing'; hb err; return 1; }; log "src $(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1)"
+}
+ensureSrc || exit 1
 CKPT_DS=$(mget ckptDs); GEN=$(mget gen); INTEN=$(mget inten); CK=ck/${CKPT_DS#*/}
 for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kaggle datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; hb err; exit 1; }; done
 SETUP_SEC=$(( $(date +%s) - T_BOOT )); log "setup done in ${SETUP_SEC}s: $(nproc) cpus; torch $(python -c 'import torch;print(torch.__version__)')"
@@ -216,7 +219,7 @@ PY
 IDLE=0
 while :; do
   ST=$(killState); if [ "$ST" = kill ]; then hb killed; log 'KILL: exiting'; exit 0; elif [ "$ST" = pause ]; then hb paused; log 'PAUSE'; zz 300; continue; fi
-  NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; }
+  NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; ensureSrc || { zz 300; continue; }; }
   getJobs || { hb err; zz 300; continue; }
   [ "$ST_JOB" = "$JOB" ] || { selftest; ST_JOB=$JOB; }
   [ "$SELFTEST" = fail ] && { log 'selftest failed: refusing to claim'; hb selftestFail; zz 600; ST_JOB=; continue; }
