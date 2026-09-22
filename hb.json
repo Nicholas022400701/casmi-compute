@@ -1,0 +1,1 @@
+{"id": "p03", "idx": 3, "job": "ranker", "status": "running", "shard": 53, "chunk": 33, "jobsDone": 25190, "rate": 0.361, "err429": 0, "setupSec": 1, "selftest": "pass", "killtest": "00", "ts": 1790060835.827419, "tsUtc": "2026-09-22T07:07:15Z", "done": ["canary:3", "ranker:28", "ranker:3"]}
