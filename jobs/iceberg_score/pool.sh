@@ -5,7 +5,7 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
-POOL_VER=7   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
+POOL_VER=8   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
 REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}; PAUSE_IDS_URL=${PAUSE_IDS_URL:-$RAW/PAUSE_ids}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
@@ -177,6 +177,14 @@ selftest() {  # 8 known-answer ICE jobs; SELFTEST=pass|fail|none; a worker never
   rm -rf st && PYTHONPATH=src python -m casmi.fwdsim.runIceberg --jobs st_jobs.parquet --out st $(iceArgs) --shard 0/1 > log/selftest.log 2>&1
   read -r SELFTEST STD STN <<< "$(python stcmp.py "${F:+jobs/$F}" "${EF:+jobs/$EF}" 2>>log/selftest.log | tail -1)"; SELFTEST=${SELFTEST:-fail}; log "selftest $SELFTEST maxAbsDiff ${STD:-?} jobs ${STN:-0} tol $(mget selftest.tol 2>/dev/null || echo 1e-6)"
 }
+recoverDone() {  # done list lost (fresh sandbox / restart): rebuild hb/done.txt from my dataset's <job>_sNN_summary.json files (paged listing)
+  local ds tok= out n=0; ds="nicholasooo/$(mget dsPrefix)-$ID"
+  while :; do out=$(kaggle datasets files "$ds" --page-size 200 ${tok:+--page-token "$tok"} 2>/dev/null) || break
+    grep -oE '^[A-Za-z0-9]+_s[0-9]+_summary\.json' <<< "$out" | sed -E 's/^([A-Za-z0-9]+)_s0*([0-9]+)_summary\.json/\1:\2/' >> hb/done.txt
+    tok=$(grep -oE 'Next Page Token = [^ ]+' <<< "$out" | awk '{print $NF}'); [ -z "$tok" ] && break; n=$((n+1)); [ "$n" -gt 20 ] && break; done
+  [ -f hb/done.txt ] && { sort -u -o hb/done.txt hb/done.txt; log "recoverDone: $(wc -l < hb/done.txt) shards already published"; }
+}
+[ -s hb/done.txt ] || recoverDone
 getJobs && selftest; ST_JOB=$JOB
 hb ready
 publish() {  # $1 out dir $2 shard tag  -> version (or create) my dataset with all finished shards
