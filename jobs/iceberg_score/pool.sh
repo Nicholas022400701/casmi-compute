@@ -143,8 +143,9 @@ fi
 uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
 uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
 WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1 | cut -d' ' -f1)
-[ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "casmi-src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
-[ -f src/casmi/fwdsim/runIceberg.py ] || kaggle datasets download nicholasooo/casmi-src -p . --unzip -q
+[ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
+SRC_DS=$(mget srcDataset 2>/dev/null); SRC_FILE=$(mget srcFile 2>/dev/null)   # pinned snapshot (zip with src/ + src/COMMIT.txt) beats the floating casmi-src dataset
+[ -f src/casmi/fwdsim/runIceberg.py ] || { if [ -n "$SRC_FILE" ]; then kaggle datasets download "$SRC_DS" -f "$SRC_FILE" -p . -q --unzip && rm -f "$SRC_FILE"; else kaggle datasets download nicholasooo/casmi-src -p . --unzip -q; fi; }
 [ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
 [ -f src/casmi/fwdsim/runIceberg.py ] || { log 'casmi package missing'; hb err; exit 1; }
 CKPT_DS=$(mget ckptDs); GEN=$(mget gen); INTEN=$(mget inten); CK=ck/${CKPT_DS#*/}

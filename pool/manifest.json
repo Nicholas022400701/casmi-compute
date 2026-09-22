@@ -34,5 +34,7 @@
   "file": "selftest_ranker.json",
   "tol": 1e-06
  },
- "note": "N=100 uses rows.parquet's job-balanced shard column (min/med/max 4,361/16,025/20,170 jobs); 1,386,912 predictions"
+ "note": "shards = sorted molecule_id index % 100 (src 3bc66f2 predates the shard-column rule; pinned snapshot so a casmi-src refresh cannot change the partition mid-job); 1,386,912 predictions",
+ "srcDataset": "nicholasooo/casmi-c1-pool-jobs",
+ "srcFile": "src_3bc66f2.zip"
 }
