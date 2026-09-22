@@ -5,7 +5,7 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
-POOL_VER=10   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
+POOL_VER=11   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
 REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}; PAUSE_IDS_URL=${PAUSE_IDS_URL:-$RAW/PAUSE_ids}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
@@ -28,6 +28,8 @@ cat > claim.py <<'PY'
 import json, re, subprocess, sys, time
 id_, idx, boot = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]); mf = json.load(open('manifest.json')); pat = re.compile(mf.get('idPattern', r'^p\d+$'))
 job, N, W, stale, grace, steal = mf['job'], int(mf['N']), int(mf['W']), float(mf.get('staleMin', 30)), float(mf.get('graceMin', 20)), mf.get('steal', 'stale')
+idx = idx % W   # replacement workers (idx >= W) own the shards of the id they replace
+reserved = {int(s) for s in (mf.get('reserved') or {}).get(job, [])}   # shards handed to kernel workers (kpool.sh): never claimed by the pool
 def git(*a): return subprocess.run(['git', *a], cwd='hb', capture_output=True, text=True).stdout
 git('fetch', '-q', '-p', 'origin', '+refs/heads/hb/*:refs/remotes/hb/*')
 hbs = []
@@ -37,10 +39,11 @@ for r in git('for-each-ref', '--format=%(refname)', 'refs/remotes/hb/').split():
 now = time.time(); active = set(); byIdx = {}
 try: done = {int(d.split(':')[1]) for d in open('hb/done.txt').read().split() if d.startswith(job + ':')}
 except Exception: done = set()
+done |= reserved
 for h in hbs:
     done |= {int(d.split(':')[1]) for d in (h.get('done') or []) if isinstance(d, str) and d.startswith(job + ':')}
     if h.get('id') == id_: continue
-    byIdx.setdefault(h.get('idx'), []).append(h)
+    byIdx.setdefault(int(h.get('idx') or 0) % W, []).append(h)   # replacement ids fold onto the slot they replace
     if h.get('job') == job and h.get('shard') is not None and h.get('status') in ('running', 'publishing', 'paused') and now - h.get('ts', 0) < stale * 60: active.add(int(h['shard']))
 own = [s for s in range(N) if s % W == idx and s not in done and s not in active]
 def stealable(s):
