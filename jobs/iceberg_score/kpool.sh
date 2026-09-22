@@ -1,13 +1,13 @@
 #!/bin/bash
 # kpool.sh — Kaggle CPU-kernel worker (static shard list, no secrets, no heartbeats).  Inputs come from datasets attached to the kernel
-# (/kaggle/input/<slug>): casmi-m2-fwdsim-wheels, casmi-m2-fwdsim-assets, casmi-c1-pool-jobs (src snapshot), <jobs dataset>.  Outputs land in
+# (/kaggle/input/datasets/nicholasooo/<slug>): casmi-m2-fwdsim-wheels, casmi-m2-fwdsim-assets, casmi-c1-pool-jobs (src snapshot), <jobs dataset>.  Outputs land in
 # /kaggle/working/out/<job>_sNN/ (chunk*.parquet, module files, pool_summary.json); C1 pulls them with `kaggle kernels output` and publishes casmi-c1-pool-<KID>.
 # env: KID=k0 JOB=ranker N=100 SHARDS="90 91 92" JOBS_DS=casmi-m2-ranker-jobs ARGS="--rows jobs/rows.parquet --queries jobs/queries.parquet --head all --tag ranker"
 #      [MODULE=casmi.fwdsim.runShard] [SRC_DIR=src_4a3d6d5] [PAR=2] [THREADS=2] [BATCH=16] [CHUNK=512] [MAXNODES=100] [SPARSEK=100] [IN=/kaggle/input] [OUT=/kaggle/working/out] [ROOT=/kaggle/working/w]
 set -uo pipefail
 : "${KID:?}" "${JOB:?}" "${N:?}" "${SHARDS:?}" "${JOBS_DS:?}" "${ARGS:?}"
 MODULE=${MODULE:-casmi.fwdsim.runShard}; SRC_DIR=${SRC_DIR:-src_4a3d6d5}; PAR=${PAR:-2}; THREADS=${THREADS:-2}; BATCH=${BATCH:-16}; CHUNK=${CHUNK:-512}; MAXNODES=${MAXNODES:-100}; SPARSEK=${SPARSEK:-100}
-IN=${IN:-/kaggle/input}; OUT=${OUT:-/kaggle/working/out}; ROOT=${ROOT:-/kaggle/working/w}; T_BOOT=$(date +%s)
+IN=${IN:-/kaggle/input/datasets/nicholasooo}; OUT=${OUT:-/kaggle/working/out}; ROOT=${ROOT:-/kaggle/working/w}; T_BOOT=$(date +%s)
 GEN=iceberg_msg_all/gen/best.ckpt; INTEN=iceberg_msg_all/inten_contr/best.ckpt; CK=$IN/casmi-m2-fwdsim-assets
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 mkdir -p "$ROOT" "$OUT" && cd "$ROOT"
