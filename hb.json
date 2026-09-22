@@ -1,1 +1,1 @@
-{"id": "f2-mlp2k", "idx": 7, "status": "running", "shard": 2, "chunk": 11, "jobsDone": 48243, "rate": 1261.7, "err429": 0, "setupSec": 12, "selftest": "ok", "done": false, "ts": 1790064527.2239451, "arch": "mlp2k", "x": 0.9}
+{"id": "f2-mlp2k", "idx": 7, "status": "done", "shard": 2, "chunk": 11, "jobsDone": 49243, "rate": 1262.3, "err429": 0, "setupSec": 12, "selftest": "ok", "done": true, "ts": 1790064758.5480456, "arch": "mlp2k", "x": 0.9}
