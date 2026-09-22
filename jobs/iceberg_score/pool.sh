@@ -5,7 +5,7 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
-POOL_VER=11   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
+POOL_VER=12   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
 REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}; PAUSE_IDS_URL=${PAUSE_IDS_URL:-$RAW/PAUSE_ids}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
@@ -165,9 +165,13 @@ printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$(mget 
 getJobs() {  # download every input of the manifest from jobsDataset (once per job), adapt the ICE job table if the module is runIceberg
   JOBS_DS=$(mget jobsDataset); JOBS_FILE=$(mget jobsFile 2>/dev/null); local f
   [ "$(cat jobs/.job 2>/dev/null)" = "$JOB $JOBS_DS" ] || { log "inputs for $JOB from $JOBS_DS (clearing cached inputs)"; rm -rf jobs; mkdir -p jobs; echo "$JOB $JOBS_DS" > jobs/.job; }   # job-aware cache: same file names across jobs must not be reused
+  local bad=0 want have
   for f in $(python -c "import json;m=json.load(open('manifest.json'));print(' '.join(m.get('inputs') or [m['jobsFile']]))"); do
     [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "input missing $JOBS_DS/$f"; return 1; }
+    want=$(python -c "import json,sys;print((json.load(open('manifest.json')).get('inputsMd5') or {}).get(sys.argv[1], ''))" "$f")   # D78: manifest pins the md5 of every input; 'latest' on Kaggle can move
+    if [ -n "$want" ]; then have=$(md5sum "jobs/$f" | cut -d' ' -f1); [ "$have" = "$want" ] || { log "input md5 mismatch $f: have $have want $want (refusing; file removed)"; rm -f "jobs/$f"; bad=1; }; fi
   done
+  [ "$bad" = 0 ] || return 2
   MODULE=$(mget module 2>/dev/null); MODULE=${MODULE:-casmi.fwdsim.runIceberg}; MARGS=$(mget args 2>/dev/null)
   if [ "$MODULE" = casmi.fwdsim.runIceberg ]; then python adapt.py "jobs/$JOBS_FILE" "jobs/ice_$JOBS_FILE" || return 1; MARGS="${MARGS:---jobs jobs/ice_$JOBS_FILE}"; fi
 }
@@ -190,7 +194,7 @@ recoverDone() {  # done list lost (fresh sandbox / restart): rebuild hb/done.txt
   [ -f hb/done.txt ] && { sort -u -o hb/done.txt hb/done.txt; log "recoverDone: $(wc -l < hb/done.txt) shards already published"; }
 }
 [ -s hb/done.txt ] || recoverDone
-getJobs && selftest; ST_JOB=$JOB
+getJobs; GJ=$?; [ "$GJ" = 2 ] && { log "inputs do not match manifest inputsMd5"; hb inputMismatch; }; if [ "$GJ" = 0 ]; then selftest; ST_JOB=$JOB; else ST_JOB=; fi   # inputs bad at boot: selftest runs once they verify
 hb ready
 publish() {  # $1 out dir $2 shard tag  -> version (or create) my dataset with all finished shards
   for f in "$1"/*; do [ -f "$f" ] && ln -f "$f" "ds/${JOB}_$2_$(basename "$f")"; done
@@ -238,7 +242,7 @@ while :; do
   NEWJOB=$(mf)   # refresh manifest first so the version check below sees the current poolVer (was one shard late)
   PV=$(mget poolVer 2>/dev/null); if [ -n "$PV" ] && [ "$PV" != "$POOL_VER" ]; then PU=$(mget poolUrl 2>/dev/null); curl -sSfL --max-time 60 "$PU" -o pool.new && bash -n pool.new && { log "self-update poolVer $POOL_VER -> $PV"; mv -f pool.new pool.sh; exec bash pool.sh; }; log 'self-update failed'; fi
   [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; ensureSrc || { zz 300; continue; }; }
-  getJobs || { hb err; zz 300; continue; }
+  getJobs; GJ=$?; [ "$GJ" = 2 ] && { log 'inputs do not match manifest inputsMd5: not claiming'; hb inputMismatch; zz 600; continue; }; [ "$GJ" = 0 ] || { hb err; zz 300; continue; }
   [ "$ST_JOB" = "$JOB" ] || { selftest; ST_JOB=$JOB; }
   [ "$SELFTEST" = fail ] && { log 'selftest failed: refusing to claim'; hb selftestFail; zz 600; ST_JOB=; continue; }
   read -r PICK ND NA NH <<< "$(python claim.py "$ID" "$IDX" "$T_BOOT" 2>&1 | tail -1)"; log "claim: shard $PICK (done $ND active $NA heartbeats $NH)"
