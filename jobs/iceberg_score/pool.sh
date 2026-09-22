@@ -31,7 +31,9 @@ hbs = []
 for r in git('for-each-ref', '--format=%(refname)', 'refs/remotes/hb/').split():
     try: hbs.append(json.loads(git('show', f'{r}:hb.json')))
     except Exception: pass
-now = time.time(); done = set(); active = set(); byIdx = {}
+now = time.time(); active = set(); byIdx = {}
+try: done = {int(d.split(':')[1]) for d in open('hb/done.txt').read().split() if d.startswith(job + ':')}
+except Exception: done = set()
 for h in hbs:
     done |= {int(d.split(':')[1]) for d in h.get('done', []) if d.startswith(job + ':')}
     if h.get('id') == id_: continue
@@ -151,7 +153,7 @@ while :; do
   getJobs || { hb err; zz 300; continue; }
   read -r PICK ND NA NH <<< "$(python claim.py "$ID" "$IDX" "$T_BOOT" 2>&1 | tail -1)"; log "claim: shard $PICK (done $ND active $NA heartbeats $NH)"
   [[ "$PICK" =~ ^-?[0-9]+$ ]] || { log 'claim failed'; hb err; zz 120; continue; }
-  if [ "$PICK" = -1 ]; then [ $IDLE = 0 ] && hb idle; IDLE=1; zz 300; continue; fi
+  if [ "$PICK" = -1 ]; then hb idle; IDLE=1; zz 300; continue; fi
   IDLE=0; runShard "$PICK"; RC=$?
   case $RC in 9) exit 9;; 2) zz 300;; 3) log 'KILL: exiting'; exit 0;; esac
 done
