@@ -1,17 +1,21 @@
-# ICEBERG CPU scoring of a sharded job table (private Kaggle dataset) -> private per-shard Kaggle datasets.
-# Same wrapper as the sandbox pool (jobs/iceberg_score/run.sh); logs print counts and timings only.
+# ICEBERG CPU scoring of a sharded job table (private Kaggle dataset) -> one private Kaggle dataset per shard (nicholasooo/<dsprefix>-sNN).
+# One matrix job per shard, each running jobs/iceberg_score/shard.sh (same module, pinned source snapshot, checkpoints, md5-verified inputs
+# and output layout as the sandbox pool's pool.sh / kernel kpool.sh, so downstream compare/merge does not care about the source).
+# Logs print counts and timings only — never SMILES, keys or tokens. Account-wide cap: 20 concurrent jobs across all workflows.
 name: iceberg-score
 on:
   workflow_dispatch:
     inputs:
-      shards:   {description: 'JSON list of shard ids, e.g. [7,16]', required: true}
-      n:        {description: 'number of shards the job table is split into', required: true}
-      jobsDs:   {description: 'private Kaggle dataset holding the job table', required: true}
-      jobsFile: {description: 'job table parquet file name', required: true}
-      dsprefix: {description: 'output dataset prefix (nicholasooo/<prefix>-sNN)', required: true}
-      chunk:    {description: 'jobs per chunk file', default: '512'}
-      ckptMin:  {description: 'minutes between checkpoint uploads', default: '10'}
-      threads:  {description: 'torch threads', default: '4'}
+      shards:   {description: 'JSON list of shard ids, e.g. [28] or [1,15,21]', required: true}
+      n:        {description: 'number of shards the job table is split into', required: true, default: '100'}
+      job:      {description: 'job name / output tag (file prefix <job>_sNN_)', required: true, default: 'ranker'}
+      jobsDs:   {description: 'private Kaggle dataset holding the job table', required: true, default: 'nicholasooo/casmi-m2-ranker-jobs'}
+      inputs:   {description: 'comma list of files to fetch from jobsDs into jobs/', required: true, default: 'rows.parquet,queries.parquet,plan.json'}
+      jobsMd5:  {description: 'optional comma list file=md5 pins; any mismatch aborts the shard (D78)', required: false, default: ''}
+      args:     {description: 'module args (empty = ranker default: --rows jobs/rows.parquet --queries jobs/queries.parquet --head all --tag <job>)', required: false, default: ''}
+      dsprefix: {description: 'output dataset prefix -> nicholasooo/<dsprefix>-sNN', required: true}
+      threads:  {description: 'torch threads (ubuntu-latest has 4 vCPU)', required: false, default: '4'}
+      chunk:    {description: 'jobs per chunk parquet', required: false, default: '512'}
 permissions:
   contents: read
 jobs:
@@ -23,12 +27,20 @@ jobs:
       max-parallel: 20
       matrix:
         shard: ${{ fromJSON(inputs.shards) }}
+    name: shard ${{ matrix.shard }}
     env:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      JOB: ${{ inputs.job }}
+      SHARD: ${{ matrix.shard }}
+      N: ${{ inputs.n }}
+      JOBS_DS: ${{ inputs.jobsDs }}
+      INPUTS: ${{ inputs.inputs }}
+      JOBS_MD5: ${{ inputs.jobsMd5 }}
+      ARGS: ${{ inputs.args }}
+      DSPREFIX: ${{ inputs.dsprefix }}
+      THREADS: ${{ inputs.threads }}
+      CHUNK: ${{ inputs.chunk }}
     steps:
       - uses: actions/checkout@v4
       - name: score shard
-        run: |
-          ROOT=$HOME/ice JOBS_DS='${{ inputs.jobsDs }}' JOBS_FILE='${{ inputs.jobsFile }}' SHARD='${{ matrix.shard }}' N='${{ inputs.n }}' \
-          DSPREFIX='${{ inputs.dsprefix }}' CHUNK='${{ inputs.chunk }}' CKPT_MIN='${{ inputs.ckptMin }}' THREADS='${{ inputs.threads }}' \
-          bash jobs/iceberg_score/run.sh
+        run: bash jobs/iceberg_score/shard.sh
