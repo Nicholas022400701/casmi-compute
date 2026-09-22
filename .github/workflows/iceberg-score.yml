@@ -49,6 +49,6 @@ jobs:
         if: always()
         with:
           name: enc-${{ inputs.job }}-s${{ matrix.shard }}
-          path: ~/ice/art/
+          path: /home/runner/ice/art/
           retention-days: 3
           if-no-files-found: ignore
