@@ -41,5 +41,29 @@
  "poolVer": 11,
  "poolUrl": "https://raw.githubusercontent.com/Nicholas022400701/casmi-compute/a3410d6/jobs/iceberg_score/pool.sh",
  "idPattern": "^p\\d+$",
- "reserved": {}
+ "reserved": {
+  "ranker": [
+   46,
+   47,
+   48,
+   51,
+   54,
+   55,
+   57,
+   58,
+   60,
+   63,
+   64,
+   65,
+   71,
+   72,
+   73,
+   75,
+   76,
+   77,
+   78,
+   79
+  ]
+ },
+ "reservedNote": "kernel workers k0-k3 (kpool.sh): k0 48 54 58 75 79 | k1 46 57 72 73 78 | k2 51 55 65 71 76 | k3 47 60 63 64 77; pool never claims these"
 }
