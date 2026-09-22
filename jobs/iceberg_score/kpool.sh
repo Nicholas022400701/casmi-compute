@@ -15,16 +15,11 @@ log "inputs under $IN:"; find "$IN" -maxdepth 3 2>/dev/null | head -60; nproc; f
 # ---- setup: with internet -> python 3.12 venv + full ICE wheel set (as pool.sh); without -> Kaggle stock python/torch + wheels only (compat shims for torch_scatter/pygmtools) ----
 NET=0; curl -sI --max-time 8 https://pypi.org >/dev/null 2>&1 && NET=1; log "internet: $NET"
 mkdir -p wh; [ -f wh/.done ] || { cp "$IN"/casmi-m2-fwdsim-wheels/*.whl wh/ && (cd wh && for f in *2.6.0cpu*.whl; do [ -f "$f" ] && mv "$f" "${f/2.6.0cpu/2.6.0+cpu}"; done; for f in *pt26cpu*.whl; do [ -f "$f" ] && mv "$f" "${f/2.1.2pt26cpu/2.1.2+pt26cpu}"; done; true) && touch wh/.done; }
-if [ "$NET" = 1 ]; then
-  export PATH=$HOME/.local/bin:$PATH; which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
-  [ -d venv ] || uv venv -q --python 3.12 venv; source venv/bin/activate; PY=python
-  uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib polars pyarrow
-  uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
-else
-  PY=python3; $PY -m pip install -q --no-index --no-deps --find-links wh ms_pred dgl rdkit dill multiprocess platformdirs lightning_utilities torchmetrics pytorch_lightning 2>&1 | grep -v -i 'wrapt\|sitecustomize' | tail -3
-fi
+PY=python3   # Kaggle stock python 3.12: install the pool's exact ICE wheel set (torch 2.6.0+cpu, dgl, torch_scatter, ms_pred, rdkit...) over the stock packages
+[ "$NET" = 1 ] && $PY -m pip install -q sympy==1.13.1 einops polars pyarrow 2>&1 | grep -v -i 'wrapt\|sitecustomize' | tail -2
+$PY -m pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred 2>&1 | grep -v -i 'wrapt\|sitecustomize' | tail -3
 $PY - <<'PYCHK' || { log 'missing modules'; exit 1; }
-import importlib, sys
+import importlib.util, sys
 miss = [m for m in ('torch', 'dgl', 'rdkit', 'ms_pred', 'polars', 'pyarrow', 'numpy', 'pandas', 'pytorch_lightning') if importlib.util.find_spec(m) is None]
 print('missing:', miss) if miss else print('modules ok'); sys.exit(1 if miss else 0)
 PYCHK
