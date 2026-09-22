@@ -13,7 +13,7 @@
  ],
  "module": "casmi.fwdsim.runShard",
  "args": "--rows jobs/rows.parquet --queries jobs/queries.parquet --head all --tag ranker",
- "srcCommit": "0a23b89",
+ "srcCommit": "4a3d6d5",
  "dsPrefix": "casmi-c1-pool",
  "runner": "iceberg_score/pool.sh",
  "staleMin": 30,
@@ -34,7 +34,7 @@
   "file": "selftest_ranker.json",
   "tol": 1e-06
  },
- "note": "src pinned to main 0a23b89 (>= e4d436e: rows.parquet shard column, mass-contiguous job-balanced shards, N=100); job table casmi-m2-ranker-jobs v2; 1,386,912 predictions",
+ "note": "src pinned to main 4a3d6d5 (E1b re-cut; includes e4d436e shard-column rule: mass-contiguous job-balanced shards, N=100); job table casmi-m2-ranker-jobs v2; 1,386,912 predictions",
  "srcDataset": "nicholasooo/casmi-c1-pool-jobs",
- "srcFile": "src_0a23b89.zip"
+ "srcDir": "src_4a3d6d5"
 }

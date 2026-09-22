@@ -145,8 +145,8 @@ uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter p
 ensureSrc() {  # pinned snapshot (manifest srcDataset/srcFile: zip with src/ + src/COMMIT.txt) or floating casmi-src; refreshed when COMMIT differs from manifest srcCommit
   local WANT HAVE SRC_DS SRC_FILE; WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1 | cut -d' ' -f1)
   [ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
-  SRC_DS=$(mget srcDataset 2>/dev/null); SRC_FILE=$(mget srcFile 2>/dev/null)
-  [ -f src/casmi/fwdsim/runIceberg.py ] || { if [ -n "$SRC_FILE" ]; then kaggle datasets download "$SRC_DS" -f "$SRC_FILE" -p . -q --unzip && rm -f "$SRC_FILE"; else kaggle datasets download nicholasooo/casmi-src -p . --unzip -q; fi; }
+  SRC_DS=$(mget srcDataset 2>/dev/null); SRC_DIR=$(mget srcDir 2>/dev/null)   # snapshot folder <srcDir>/src inside srcDataset (Kaggle unpacks uploaded zips)
+  [ -f src/casmi/fwdsim/runIceberg.py ] || { if [ -n "$SRC_DIR" ]; then rm -rf srcdl && kaggle datasets download "$SRC_DS" -p srcdl -q --unzip && mv "srcdl/$SRC_DIR/src" src && rm -rf srcdl; else kaggle datasets download nicholasooo/casmi-src -p . --unzip -q; fi; }
   [ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
   [ -f src/casmi/fwdsim/runIceberg.py ] || { log 'casmi package missing'; hb err; return 1; }; log "src $(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1)"
 }
