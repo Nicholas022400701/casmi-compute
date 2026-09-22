@@ -61,6 +61,11 @@ PY
 # ---- publish: nicholasooo/<DSPREFIX>-sNN with pool-style file names ----
 for f in "$OUT"/*; do [ -f "$f" ] && ln -f "$f" "ds/${JOB}_${S}_$(basename "$f")"; done
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$DSPREFIX-$S" "$DS" > ds/dataset-metadata.json
-R=$(kg datasets create -p ds -q); case "$R" in *rror*|*exists*|*already*) R=$(kg datasets version -p ds -q -m "$JOB $S $(date -u +%H:%M)");; esac; log "publish: ${R: -100}"
+# publish with retries: create -> (exists) version; any other answer (403/429/5xx, seen 'Forbidden' on CreateDatasetVersion at 18:01 when 3 datasets were created within 70 s) -> wait and retry; then verify by file listing
+PUB=0; for i in 1 2 3 4 5 6 7 8; do
+  R=$(kg datasets create -p ds -q); case "$R" in *"being created"*|*uccess*) PUB=1;; *exists*|*already*) R=$(kg datasets version -p ds -q -m "$JOB $S $(date -u +%H:%M)"); case "$R" in *"being created"*|*uccess*) PUB=1;; esac;; esac
+  log "publish attempt $i: ${R: -90}"; [ "$PUB" = 1 ] && break; sleep $(( 30 * i + RANDOM % 30 )); done
 for w in 60 60 90 120 150 180; do sleep $w; kg datasets files "$DS" --page-size 500 | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done   # 6 API calls per shard (shared account budget)
+# last resort: keep the output as an encrypted artifact (workflow uploads $ROOT/art) so a failed publish never loses the shard
+if [ -n "${CASMI_ENC_KEY:-}" ]; then mkdir -p art && tar cf - -C ds . | gzip -1 | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:CASMI_ENC_KEY -out "art/${JOB}_${S}.tar.gz.enc" && log "encrypted fallback artifact written ($(du -k "art/${JOB}_${S}.tar.gz.enc" | cut -f1) KB)"; fi
 log "dataset NOT verified after 11 min: $DS"; echo "DONE (upload unverified) rc=$RC"; exit 1

@@ -30,6 +30,7 @@ jobs:
     name: shard ${{ matrix.shard }}
     env:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      CASMI_ENC_KEY: ${{ secrets.CASMI_ENC_KEY }}
       JOB: ${{ inputs.job }}
       SHARD: ${{ matrix.shard }}
       N: ${{ inputs.n }}
@@ -44,3 +45,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: score shard
         run: bash jobs/iceberg_score/shard.sh
+      - uses: actions/upload-artifact@v4   # only exists when the Kaggle publish failed: encrypted copy of the shard output
+        if: always()
+        with:
+          name: enc-${{ inputs.job }}-s${{ matrix.shard }}
+          path: ~/ice/art/
+          retention-days: 3
+          if-no-files-found: ignore
