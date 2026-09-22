@@ -13,24 +13,27 @@ CKPT_DS=${CKPT_DS:-nicholasooo/casmi-m2-fwdsim-assets}; GEN=${GEN:-iceberg_msg_a
 THREADS=${THREADS:-4}; CHUNK=${CHUNK:-512}; BATCH=${BATCH:-16}; MAXNODES=${MAXNODES:-100}; SPARSEK=${SPARSEK:-100}
 ROOT=${ROOT:-$HOME/ice}; S=$(printf 's%02d' "$SHARD"); DS=nicholasooo/$DSPREFIX-$S; OUT=$ROOT/out/$S; T_BOOT=$(date +%s)
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+# every Kaggle call goes through kg(): up to 8 attempts with growing jittered backoff (matrix runs start 20-40 jobs at once -> the API answers 429 without this)
+kg() { local i R; for i in 1 2 3 4 5 6 7 8; do R=$(kaggle "$@" 2>&1) && { echo "$R"; return 0; }; case "$R" in *429*|*"Too Many"*|*timed*out*|*"Connection"*|*"503"*|*"502"*) log "kaggle ${1} ${2}: transient error (attempt $i)"; sleep $(( i * 15 + RANDOM % 30 ));; *) echo "$R"; return 1;; esac; done; echo "$R"; return 1; }
 mkdir -p "$ROOT/log" "$OUT" "$ROOT/jobs" "$ROOT/ds" && cd "$ROOT"
+STAGGER=${STAGGER:-$(( RANDOM % 90 ))}; log "start stagger ${STAGGER}s (shard $SHARD)"; sleep "$STAGGER"
 # ---- setup (identical package set to pool.sh) ----
 export PATH=$HOME/.local/bin:$PATH
 which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
 [ -d venv ] || uv venv -q --python 3.12 venv; source venv/bin/activate
 uv pip install -q kaggle
 if [ ! -f wh/.done ]; then
-  kaggle datasets download nicholasooo/casmi-m2-fwdsim-wheels -p wh --unzip -q
+  kg datasets download nicholasooo/casmi-m2-fwdsim-wheels -p wh --unzip -q >/dev/null || { log 'wheels download failed'; exit 1; }
   (cd wh && for f in *2.6.0cpu*.whl; do mv "$f" "${f/2.6.0cpu/2.6.0+cpu}"; done; for f in *pt26cpu*.whl; do mv "$f" "${f/2.1.2pt26cpu/2.1.2+pt26cpu}"; done) && touch wh/.done
 fi
 uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
 uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
 # pinned source snapshot (zip uploaded to SRC_DS, unpacked by Kaggle as <SRC_DIR>/src) and model checkpoints
-[ -f src/casmi/fwdsim/runShard.py ] || { rm -rf srcdl && kaggle datasets download "$SRC_DS" -p srcdl -q --unzip && mv "srcdl/$SRC_DIR/src" src && rm -rf srcdl; }
+[ -f src/casmi/fwdsim/runShard.py ] || { rm -rf srcdl && kg datasets download "$SRC_DS" -p srcdl -q --unzip >/dev/null && mv "srcdl/$SRC_DIR/src" src && rm -rf srcdl; }
 [ -f src/casmi/fwdsim/runShard.py ] || { log 'src snapshot missing'; exit 1; }
-CK=ck/${CKPT_DS#*/}; for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kaggle datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; exit 1; }; done
+CK=ck/${CKPT_DS#*/}; for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kg datasets download "$CKPT_DS" -f "$f" -p "$CK/$(dirname "$f")" -q --unzip >/dev/null; [ -f "$CK/$f" ] || { log "ckpt missing: $f"; exit 1; }; done
 # inputs + md5 pins
-for f in ${INPUTS//,/ }; do [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "input missing: $f"; exit 1; }; done
+for f in ${INPUTS//,/ }; do [ -f "jobs/$f" ] || kg datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip >/dev/null; [ -f "jobs/$f" ] || { log "input missing: $f"; exit 1; }; done
 PINNED=,; for kv in ${JOBS_MD5//,/ }; do f=${kv%%=*}; want=$(echo "${kv#*=}" | tr 'A-F' 'a-f'); [ -f "jobs/$f" ] || { log "md5 pin for unknown input $f"; exit 1; }; have=$(md5sum "jobs/$f" | cut -d' ' -f1); [ "$have" = "$want" ] || { log "input md5 mismatch $f: have $have want $want -> refusing"; exit 1; }; log "md5 ok $f"; PINNED="$PINNED$f,"; done
 if [ -n "$JOBS_MD5" ]; then for f in ${INPUTS//,/ }; do case "$PINNED" in *",$f,"*) ;; *) log "input $f has no md5 pin while JOBS_MD5 is set -> refusing"; exit 1;; esac; done; fi
 SRCC=$(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1); [ -n "$SRCC" ] || { log "src/COMMIT.txt missing -> refusing"; exit 1; }; case "$SRCC" in "${SRC_DIR#src_}"*) ;; *) log "src snapshot commit $SRCC does not match $SRC_DIR -> refusing"; exit 1;; esac
@@ -57,6 +60,6 @@ PY
 # ---- publish: nicholasooo/<DSPREFIX>-sNN with pool-style file names ----
 for f in "$OUT"/*; do [ -f "$f" ] && ln -f "$f" "ds/${JOB}_${S}_$(basename "$f")"; done
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$DSPREFIX-$S" "$DS" > ds/dataset-metadata.json
-R=$(kaggle datasets create -p ds -q 2>&1); case "$R" in *rror*|*exists*|*already*) R=$(kaggle datasets version -p ds -q -m "$JOB $S $(date -u +%H:%M)" 2>&1);; esac; log "publish: ${R: -100}"
-for w in 60 60 90 120 150 180; do sleep $w; kaggle datasets files "$DS" 2>/dev/null | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done   # 6 API calls per shard (shared account budget)
+R=$(kg datasets create -p ds -q); case "$R" in *rror*|*exists*|*already*) R=$(kg datasets version -p ds -q -m "$JOB $S $(date -u +%H:%M)");; esac; log "publish: ${R: -100}"
+for w in 60 60 90 120 150 180; do sleep $w; kg datasets files "$DS" | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done   # 6 API calls per shard (shared account budget)
 log "dataset NOT verified after 11 min: $DS"; echo "DONE (upload unverified) rc=$RC"; exit 1
