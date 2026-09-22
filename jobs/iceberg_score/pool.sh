@@ -142,7 +142,7 @@ if [ ! -f wh/.done ]; then
 fi
 uv pip install -q sympy==1.13.1 filelock jinja2 fsspec networkx typing-extensions setuptools packaging requests pydantic numpy pandas h5py scipy scikit-learn tqdm pyyaml einops psutil joblib matplotlib seaborn pathos easydict appdirs aiohttp pillow omegaconf polars pyarrow
 uv pip install -q --no-index --no-deps --find-links wh torch dgl torch_scatter pygmtools pytorch_lightning torchmetrics lightning_utilities platformdirs multiprocess dill rdkit ms_pred
-WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1)
+WANT=$(mget srcCommit 2>/dev/null); HAVE=$(cat src/COMMIT.txt casmi_src/COMMIT.txt 2>/dev/null | head -1 | cut -d' ' -f1)
 [ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && { log "casmi-src refresh: have '$HAVE' want '$WANT'"; rm -rf src casmi_src; }
 [ -f src/casmi/fwdsim/runIceberg.py ] || kaggle datasets download nicholasooo/casmi-src -p . --unzip -q
 [ -f src/casmi/fwdsim/runIceberg.py ] || { [ -d casmi_src/src ] && ln -sfn casmi_src/src src; }
@@ -164,7 +164,8 @@ selftest() {  # 8 known-answer ICE jobs; SELFTEST=pass|fail|none; a worker never
   SELFTEST=none; local F JF EF L f; F=$(mget selftest.file 2>/dev/null); JF=$(mget selftest.jobsFile 2>/dev/null); EF=$(mget selftest.expectedFile 2>/dev/null); L=$(mget selftest.limit 2>/dev/null)
   [ -z "$F$JF$L" ] && return 0
   [ -n "$F$JF" ] || JF=$JOBS_FILE   # legacy: first L jobs of the job table, sha1 of rounded values
-  for f in $F $JF $EF; do [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "selftest input missing $f"; SELFTEST=fail; return; }; done
+  local DS; DS=$(mget selftest.dataset 2>/dev/null); DS=${DS:-$JOBS_DS}
+  for f in $F $JF $EF; do [ -f "jobs/$f" ] || kaggle datasets download "$DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "selftest input missing $f"; SELFTEST=fail; return; }; done
   rm -f st_raw.parquet st_jobs.parquet; python stprep.py "${F:+jobs/$F}" "${JF:+jobs/$JF}" "${L:-8}" && python adapt.py st_raw.parquet st_jobs.parquet || { SELFTEST=fail; log 'selftest prep failed'; return; }
   rm -rf st && PYTHONPATH=src python -m casmi.fwdsim.runIceberg --jobs st_jobs.parquet --out st $(iceArgs) --shard 0/1 > log/selftest.log 2>&1
   read -r SELFTEST STD STN <<< "$(python stcmp.py "${F:+jobs/$F}" "${EF:+jobs/$EF}" 2>>log/selftest.log | tail -1)"; SELFTEST=${SELFTEST:-fail}; log "selftest $SELFTEST maxAbsDiff ${STD:-?} jobs ${STN:-0} tol $(mget selftest.tol 2>/dev/null || echo 1e-6)"

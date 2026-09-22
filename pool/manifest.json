@@ -1,16 +1,25 @@
 {
- "job": "canary",
- "wave": "canary",
- "W": 5,
- "N": 7,
+ "job": "ranker",
+ "wave": "25",
+ "W": 25,
+ "N": 100,
  "chunk": 512,
- "jobsDataset": "nicholasooo/casmi-c1-pool-jobs",
- "jobsFile": "jobs_canary.parquet",
+ "jobsDataset": "nicholasooo/casmi-m2-ranker-jobs",
+ "jobsDatasetVersion": 2,
+ "inputs": [
+  "rows.parquet",
+  "queries.parquet",
+  "plan.json"
+ ],
+ "module": "casmi.fwdsim.runShard",
+ "args": "--rows jobs/rows.parquet --queries jobs/queries.parquet --head all --tag ranker",
+ "srcCommit": "3bc66f2",
  "dsPrefix": "casmi-c1-pool",
  "runner": "iceberg_score/pool.sh",
- "staleMin": 6,
+ "staleMin": 30,
  "graceMin": 20,
- "hbMin": 2,
+ "hbMin": 10,
+ "steal": "any",
  "ckptDs": "nicholasooo/casmi-m2-fwdsim-assets",
  "gen": "iceberg_msg_all/gen/best.ckpt",
  "inten": "iceberg_msg_all/inten_contr/best.ckpt",
@@ -21,9 +30,9 @@
   "sparseK": 100
  },
  "selftest": {
-  "file": "selftest.json",
+  "dataset": "nicholasooo/casmi-c1-pool-jobs",
+  "file": "selftest_ranker.json",
   "tol": 1e-06
  },
- "steal": "any",
- "srcCommit": ""
+ "note": "N=100 uses rows.parquet's job-balanced shard column (min/med/max 4,361/16,025/20,170 jobs); 1,386,912 predictions"
 }
