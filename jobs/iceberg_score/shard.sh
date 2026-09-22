@@ -2,7 +2,7 @@
 # shard.sh — GitHub Actions runner for ONE shard of a sharded ICE scoring job (same module/inputs/outputs as the sandbox pool's pool.sh, no heartbeats).
 # Inputs (env): KAGGLE_API_TOKEN (secret)  JOB (name/tag, e.g. ranker)  SHARD  N  JOBS_DS (private Kaggle dataset)  INPUTS (comma list of files in JOBS_DS)
 #   [JOBS_MD5 comma list file=md5 — verified after download; mismatch, or any INPUTS file left unpinned while JOBS_MD5 is set -> exit 1 (D78)]  [ARGS module args]  [MODULE casmi.fwdsim.runShard]
-#   [SRC_DS nicholasooo/casmi-c1-pool-jobs] [SRC_DIR src_4a3d6d5]  [CKPT_DS/GEN/INTEN]  DSPREFIX (output dataset nicholasooo/<DSPREFIX>-sNN)  [THREADS 4] [CHUNK 512] [BATCH 16] [MAXNODES 100] [SPARSEK 100]
+#   [SRC_DS nicholasooo/casmi-c1-pool-jobs] [SRC_DIR src_4a3d6d5] [SRC_MD5 tree md5 pin of the snapshot's .py files; default set for src_4a3d6d5]  [CKPT_DS/GEN/INTEN]  DSPREFIX (output dataset nicholasooo/<DSPREFIX>-sNN)  [THREADS 4] [CHUNK 512] [BATCH 16] [MAXNODES 100] [SPARSEK 100]
 # Output dataset files are prefixed <JOB>_sNN_ exactly like the pool (chunk*.parquet, scores/pairs/summary/selftest, pool_summary.json with cpu model + secPerJob).
 # Logging rule: counts and timings only — never SMILES, keys, tokens.
 set -uo pipefail
@@ -33,7 +33,9 @@ CK=ck/${CKPT_DS#*/}; for f in "$GEN" "$INTEN"; do [ -f "$CK/$f" ] || kaggle data
 for f in ${INPUTS//,/ }; do [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "input missing: $f"; exit 1; }; done
 PINNED=,; for kv in ${JOBS_MD5//,/ }; do f=${kv%%=*}; want=$(echo "${kv#*=}" | tr 'A-F' 'a-f'); [ -f "jobs/$f" ] || { log "md5 pin for unknown input $f"; exit 1; }; have=$(md5sum "jobs/$f" | cut -d' ' -f1); [ "$have" = "$want" ] || { log "input md5 mismatch $f: have $have want $want -> refusing"; exit 1; }; log "md5 ok $f"; PINNED="$PINNED$f,"; done
 if [ -n "$JOBS_MD5" ]; then for f in ${INPUTS//,/ }; do case "$PINNED" in *",$f,"*) ;; *) log "input $f has no md5 pin while JOBS_MD5 is set -> refusing"; exit 1;; esac; done; fi
-SRCC=$(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1); if [ -n "$SRCC" ]; then case "$SRCC" in "${SRC_DIR#src_}"*) ;; *) log "src snapshot commit $SRCC does not match $SRC_DIR -> refusing"; exit 1;; esac; else log "src snapshot $SRC_DIR (git-archive, no COMMIT.txt): $(find src -name '*.py' | wc -l) py files"; fi
+SRCC=$(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1); [ -n "$SRCC" ] || { log "src/COMMIT.txt missing -> refusing"; exit 1; }; case "$SRCC" in "${SRC_DIR#src_}"*) ;; *) log "src snapshot commit $SRCC does not match $SRC_DIR -> refusing"; exit 1;; esac
+[ -n "${SRC_MD5:-}" ] || [ "$SRC_DIR" != src_4a3d6d5 ] || SRC_MD5=ae7e29626a48f443ad1813fd188a2151   # tree md5 of the 4a3d6d5 snapshot's non-empty .py files (sorted paths, md5sum | md5sum)
+TREE=$(cd src && find . -name '*.py' -size +0 | LC_ALL=C sort | xargs md5sum | md5sum | cut -d' ' -f1); if [ -n "${SRC_MD5:-}" ]; then [ "$TREE" = "$SRC_MD5" ] || { log "src tree md5 $TREE != pinned $SRC_MD5 -> refusing"; exit 1; }; fi; log "src $SRCC tree md5 $TREE ($(find src -name '*.py' | wc -l) py files)"
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //'); log "setup done in $(( $(date +%s) - T_BOOT ))s: $(nproc) cpus ($CPU); torch $(python -c 'import torch;print(torch.__version__)'); src $(head -1 src/COMMIT.txt 2>/dev/null | cut -d' ' -f1); shard $SHARD/$N job $JOB"
 # ---- run ----
 T0=$(date +%s)
@@ -56,5 +58,5 @@ PY
 for f in "$OUT"/*; do [ -f "$f" ] && ln -f "$f" "ds/${JOB}_${S}_$(basename "$f")"; done
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$DSPREFIX-$S" "$DS" > ds/dataset-metadata.json
 R=$(kaggle datasets create -p ds -q 2>&1); case "$R" in *rror*|*exists*|*already*) R=$(kaggle datasets version -p ds -q -m "$JOB $S $(date -u +%H:%M)" 2>&1);; esac; log "publish: ${R: -100}"
-for i in $(seq 1 10); do sleep 60; kaggle datasets files "$DS" 2>/dev/null | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done
-log "dataset NOT verified after 10 min: $DS"; echo "DONE (upload unverified) rc=$RC"; exit 1
+for w in 60 60 90 120 150 180; do sleep $w; kaggle datasets files "$DS" 2>/dev/null | grep -q "_${S}_pool_summary.json" && { log "dataset ready: $DS"; echo "DONE rc=$RC"; exit $RC; }; done   # 6 API calls per shard (shared account budget)
+log "dataset NOT verified after 11 min: $DS"; echo "DONE (upload unverified) rc=$RC"; exit 1
