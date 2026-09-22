@@ -13,10 +13,13 @@ on:
       procs:    {description: 'passed as PROCS (empty = nproc)', required: false, default: ''}
       cmd:      {description: 'command run inside the bundle dir', required: false, default: 'bash run.sh'}
       outDir:   {description: 'output dir the script writes (relative to bundle dir)', required: false, default: 'out'}
+      collectRun: {description: 'recovery: skip the shard jobs and only re-collect the encrypted artifacts of this earlier run id into outDs', required: false, default: ''}
 permissions:
   contents: read
+  actions: read
 jobs:
   run:
+    if: ${{ inputs.collectRun == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
     strategy:
@@ -61,5 +64,7 @@ jobs:
         with:
           pattern: enc-s*
           path: art
+          run-id: ${{ inputs.collectRun || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: publish one dataset
         run: bash jobs/run_script/collect.sh

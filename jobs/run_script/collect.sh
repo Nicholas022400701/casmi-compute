@@ -6,7 +6,9 @@ log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 mkdir -p "$ROOT/ds" && export PATH=$HOME/.local/bin:$PATH; which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
 which zstd >/dev/null 2>&1 || sudo apt-get install -y -qq zstd >/dev/null 2>&1
 uv venv -q --python 3.12 "$ROOT/kvenv" && uv pip install -q --python "$ROOT/kvenv/bin/python" kaggle; K=$ROOT/kvenv/bin/kaggle
-n=0; for f in $(find "$ART" -name '*.tar.zst.enc' | sort); do openssl enc -d -aes-256-cbc -pbkdf2 -pass env:CASMI_ENC_KEY -in "$f" | zstd -dq | tar xf - -C "$ROOT/ds" && n=$((n+1)); done
+# each shard is unpacked into its own folder, then merged flat: a file name that already exists in ds/ gets the shard prefix sNN_ (scripts that write fixed names like harness.json per shard stay distinguishable)
+n=0; dup=0; for f in $(find "$ART" -name '*.tar.zst.enc' | sort); do S=$(basename "$f" .tar.zst.enc); T=$ROOT/tmp/$S; mkdir -p "$T"; openssl enc -d -aes-256-cbc -pbkdf2 -pass env:CASMI_ENC_KEY -in "$f" | zstd -dq | tar xf - -C "$T" || { log "decrypt/untar failed for $S"; continue; }
+  while IFS= read -r -d '' x; do rel=${x#$T/}; b=$(basename "$rel"); if [ -e "$ROOT/ds/$b" ]; then mv "$x" "$ROOT/ds/${S}_$b"; dup=$((dup+1)); else mv "$x" "$ROOT/ds/$b"; fi; done < <(find "$T" -type f -print0); n=$((n+1)); done; log "name collisions resolved with shard prefix: $dup"
 log "shards collected: $n; files $(find "$ROOT/ds" -type f | wc -l); $(du -sm "$ROOT/ds" | cut -f1) MB"; [ "$n" -gt 0 ] || { log "nothing to publish"; exit 1; }
 printf '{"title": "%s", "id": "nicholasooo/%s", "licenses": [{"name": "other"}]}\n' "$OUT_DS" "$OUT_DS" > "$ROOT/ds/dataset-metadata.json"
 R=$($K datasets create -p "$ROOT/ds" -q --dir-mode zip 2>&1); case "$R" in *rror*|*exists*|*already*) R=$($K datasets version -p "$ROOT/ds" -q --dir-mode zip -m "collect $(date -u +%H:%M) run ${GITHUB_RUN_ID:-local}" 2>&1);; esac; log "publish: ${R: -120}"
