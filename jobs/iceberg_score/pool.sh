@@ -5,9 +5,9 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
-POOL_VER=6   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
+POOL_VER=7   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
-REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}
+REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}; PAUSE_IDS_URL=${PAUSE_IDS_URL:-$RAW/PAUSE_ids}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
 KILLTEST=${KILLTEST:-0}; DIE=${DIE:-0}; T_BOOT=$(date +%s); ERR429=0; JOBS_DONE=0; SETUP_SEC=0; SELFTEST=none; JOB=none; RATE=0
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
@@ -71,7 +71,8 @@ out, shard, n, rc, wall, module, chunk, job = sys.argv[1], int(sys.argv[2]), int
 files = sorted(glob.glob(out + '/chunk*.parquet')); df = pl.concat([pl.read_parquet(f) for f in files]) if files else None
 rows = df.height if df is not None else 0; empty = int((df['mzs'].list.len() == 0).sum()) if df is not None and 'mzs' in df.columns else None
 ms = json.load(open(out + '/summary.json')) if os.path.exists(out + '/summary.json') else None   # module's own summary (runShard) is kept as is
-s = {'job': job, 'shard': f'{shard}/{n}', 'module': module, 'rc': rc, 'chunksDone': len(files), 'complete': rc == 0 and (ms is None or bool(ms.get('pass', True))), 'rows': rows, 'emptyPredictions': empty,
+cpu = next((l.split(':', 1)[1].strip() for l in open('/proc/cpuinfo') if l.startswith('model name')), None)
+s = {'job': job, 'shard': f'{shard}/{n}', 'module': module, 'cpu': cpu, 'rc': rc, 'chunksDone': len(files), 'complete': rc == 0 and (ms is None or bool(ms.get('pass', True))), 'rows': rows, 'emptyPredictions': empty,
      'secPerJob': round(float(df['seconds'].mean()), 4) if df is not None and 'seconds' in df.columns else None, 'wallSec': wall, 'moduleSummary': ms, 'files': sorted(os.path.basename(f) for f in glob.glob(out + '/*') if not f.endswith('pool_summary.json'))}
 json.dump(s, open(out + '/pool_summary.json', 'w'), indent=1); print('summary:', json.dumps(s)[:600])
 PY
@@ -99,7 +100,7 @@ cat > stcmp.py <<'PY'
 # compare self-test predictions with expected values -> "pass|fail <maxAbsDiff> <nCompared>"
 import glob, hashlib, json, sys, polars as pl
 mf = json.load(open('manifest.json'))['selftest']; stf, ef = sys.argv[1], sys.argv[2]; st = json.load(open(stf)) if stf else {}
-exp = st.get('expected') if st else (json.load(open(ef)) if ef else None); tol = float(st.get('tol', mf.get('tol', 1e-6)))
+exp = st.get('expected') if st else (json.load(open(ef)) if ef else None); tol = float(mf.get('tol', st.get('tol', 1e-3))); tolMz = float(mf.get('tolMz', 1e-6))   # manifest beats file; intens tol 1e-3, mz 1e-6 (D77 policy)
 f = sorted(glob.glob('st/chunk*.parquet')); d = pl.concat([pl.read_parquet(x) for x in f]) if f else None
 if d is None or d.height == 0: print('fail noOutput 0'); sys.exit(0)
 if exp is None:
@@ -107,23 +108,24 @@ if exp is None:
     print('pass' if h == mf.get('sha1') else 'fail', 'sha1', d.height); sys.exit(0)
 if isinstance(exp, list): exp = {str(i): e for i, e in enumerate(exp)}
 keyed = bool(st.get('jobs')) and 'jobId' in st['jobs'][0]
-md, n = 0.0, 0
+md, mdz, n = 0.0, 0.0, 0
 for i, r in enumerate(d.iter_rows(named=True)):
     e = exp.get(str(r['ik14'])) if keyed else exp.get(str(i))
     if e is None: continue
     n += 1
-    for a, b in ((r['mzs'], e['mzs']), (r['intens'], e['intens'])):
-        if len(a) != len(b): md = float('inf'); continue
-        for p, q in zip(a, b): md = max(md, abs(float(p) - float(q)))
-print('pass' if (n > 0 and md <= tol) else 'fail', md, n)
+    if len(r['mzs']) != len(e['mzs']) or len(r['intens']) != len(e['intens']): md = mdz = float('inf'); continue
+    for p, q in zip(r['mzs'], e['mzs']): mdz = max(mdz, abs(float(p) - float(q)))
+    for p, q in zip(r['intens'], e['intens']): md = max(md, abs(float(p) - float(q)))
+print('pass' if (n > 0 and md <= tol and mdz <= tolMz) else 'fail', f'{md:.3g}/mz{mdz:.3g}', n)
 PY
 hb() {  # status [shard] [chunksDone]
   python hbw.py "$ID" "$IDX" "$JOB" "$1" "${2:--}" "${3:-0}" "$JOBS_DONE" "$RATE" "$ERR429" "$SETUP_SEC" "$SELFTEST" "$KILLTEST$DIE" > hb/hb.json 2>/dev/null || return 0
   ( cd hb && git add hb.json && { git commit -q --amend -m "hb $ID" >/dev/null 2>&1 || git commit -q -m "hb $ID" >/dev/null 2>&1; } && gitc push -qf origin "HEAD:refs/heads/hb/$ID" >/dev/null 2>&1 ) || log "hb push failed"
 }
-killState() {  # run | pause | kill  (pool/KILL on main: empty=run, PAUSE|KILL [id] per line)
-  local k; k=$(curl -sf --max-time 20 "$KILL_URL?t=$(date +%s)" 2>/dev/null || true); local st=run
-  while read -r a b; do [ -z "$a" ] && continue; [ -n "$b" ] && [ "$b" != "$ID" ] && continue; case "$a" in KILL) st=kill;; PAUSE) [ "$st" = kill ] || st=pause;; esac; done <<< "$k"; echo $st
+killState() {  # run | pause | kill.  pool/KILL (shared with other families): whole-line KILL or PAUSE = global.  pool/PAUSE_ids (pool.sh only): one worker id per line = pause that worker
+  local k st=run; k=$(curl -sf --max-time 20 "$KILL_URL" 2>/dev/null || true)
+  while read -r a b; do [ -z "$a" ] && continue; case "$a" in KILL) st=kill;; PAUSE) [ "$st" = kill ] || st=pause;; esac; done <<< "$k"
+  [ "$st" = run ] && { k=$(curl -sf --max-time 20 "$PAUSE_IDS_URL" 2>/dev/null || true); grep -qx "$ID" <<< "$k" && st=pause; }; echo $st
 }
 mf() { curl -sf --max-time 20 "$MANIFEST_URL?t=$(date +%s)" -o manifest.new && mv manifest.new manifest.json || log "manifest fetch failed"; python -c "import json;print(json.load(open('manifest.json'))['job'])" 2>/dev/null; }
 mget() { python -c "import json,sys;m=json.load(open('manifest.json'));v=m;[v:=v[k] for k in sys.argv[1].split('.')];print(v)" "$1"; }
