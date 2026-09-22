@@ -1,0 +1,1 @@
+{"id": "p07", "idx": 7, "job": "ranker", "status": "running", "shard": 82, "chunk": 10, "jobsDone": 30920, "rate": 0.642, "err429": 0, "setupSec": 1, "selftest": "pass", "killtest": "00", "ts": 1790078546.9162958, "tsUtc": "2026-09-22T12:02:26Z", "done": ["ranker:32", "ranker:7"], "ver": 11, "cpus": 2}
