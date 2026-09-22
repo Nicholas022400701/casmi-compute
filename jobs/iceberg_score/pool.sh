@@ -5,6 +5,7 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
+POOL_VER=6   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
 REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
@@ -23,20 +24,20 @@ d['done'] = sorted(set(open('hb/done.txt').read().split())) if os.path.exists('h
 print(json.dumps(d))
 PY
 cat > claim.py <<'PY'
-import json, subprocess, sys, time
-id_, idx, boot = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]); mf = json.load(open('manifest.json'))
+import json, re, subprocess, sys, time
+id_, idx, boot = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]); mf = json.load(open('manifest.json')); pat = re.compile(mf.get('idPattern', r'^p\d+$'))
 job, N, W, stale, grace, steal = mf['job'], int(mf['N']), int(mf['W']), float(mf.get('staleMin', 30)), float(mf.get('graceMin', 20)), mf.get('steal', 'stale')
 def git(*a): return subprocess.run(['git', *a], cwd='hb', capture_output=True, text=True).stdout
 git('fetch', '-q', '-p', 'origin', '+refs/heads/hb/*:refs/remotes/hb/*')
 hbs = []
 for r in git('for-each-ref', '--format=%(refname)', 'refs/remotes/hb/').split():
-    try: hbs.append(json.loads(git('show', f'{r}:hb.json')))
+    try: h = json.loads(git('show', f'{r}:hb.json')); hbs.append(h) if pat.match(str(h.get('id', ''))) else None   # other families (R5 trainers) share hb/* but are not claimers
     except Exception: pass
 now = time.time(); active = set(); byIdx = {}
 try: done = {int(d.split(':')[1]) for d in open('hb/done.txt').read().split() if d.startswith(job + ':')}
 except Exception: done = set()
 for h in hbs:
-    done |= {int(d.split(':')[1]) for d in h.get('done', []) if d.startswith(job + ':')}
+    done |= {int(d.split(':')[1]) for d in (h.get('done') or []) if isinstance(d, str) and d.startswith(job + ':')}
     if h.get('id') == id_: continue
     byIdx.setdefault(h.get('idx'), []).append(h)
     if h.get('job') == job and h.get('shard') is not None and h.get('status') in ('running', 'publishing', 'paused') and now - h.get('ts', 0) < stale * 60: active.add(int(h['shard']))
@@ -59,7 +60,7 @@ git('fetch', '-q', '-p', 'origin', '+refs/heads/hb/*:refs/remotes/hb/*'); now = 
 for r in git('for-each-ref', '--format=%(refname)', 'refs/remotes/hb/').split():
     try: h = json.loads(git('show', f'{r}:hb.json'))
     except Exception: continue
-    if h.get('id') == id_ or h.get('job') != job or h.get('shard') != shard or h.get('status') not in ('running', 'publishing') or now - h.get('ts', 0) > 900: continue
+    if h.get('id') == id_ or h.get('job') != job or h.get('shard') != shard or h.get('status') not in ('running', 'publishing') or now - float(h.get('ts', 0) or 0) > 900 or not str(h.get('id', '')).startswith('p'): continue
     if h['ts'] < mine - 1 or (abs(h['ts'] - mine) <= 1 and h.get('idx', 99) < idx): lose = 1; print(f"conflict: {h['id']} announced shard {shard} first", file=sys.stderr)
 print(lose)
 PY
@@ -219,6 +220,7 @@ PY
 IDLE=0
 while :; do
   ST=$(killState); if [ "$ST" = kill ]; then hb killed; log 'KILL: exiting'; exit 0; elif [ "$ST" = pause ]; then hb paused; log 'PAUSE'; zz 300; continue; fi
+  PV=$(mget poolVer 2>/dev/null); if [ -n "$PV" ] && [ "$PV" != "$POOL_VER" ]; then PU=$(mget poolUrl 2>/dev/null); curl -sSfL --max-time 60 "$PU" -o pool.new && bash -n pool.new && { log "self-update poolVer $POOL_VER -> $PV"; mv -f pool.new pool.sh; exec bash pool.sh; }; log 'self-update failed'; fi
   NEWJOB=$(mf); [ -n "$NEWJOB" ] && [ "$NEWJOB" != "$JOB" ] && { JOB=$NEWJOB; log "manifest job now $JOB"; rm -f killtest.done; ensureSrc || { zz 300; continue; }; }
   getJobs || { hb err; zz 300; continue; }
   [ "$ST_JOB" = "$JOB" ] || { selftest; ST_JOB=$JOB; }
