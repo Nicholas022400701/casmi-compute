@@ -1,5 +1,29 @@
-{"job": "canary", "wave": "canary", "W": 5, "N": 7, "chunk": 512, "jobsDataset": "nicholasooo/casmi-c1-pool-jobs", "jobsFile": "jobs_canary.parquet",
- "dsPrefix": "casmi-c1-pool", "runner": "iceberg_score/pool.sh", "staleMin": 6, "graceMin": 20, "hbMin": 2,
- "ckptDs": "nicholasooo/casmi-m2-fwdsim-assets", "gen": "iceberg_msg_all/gen/best.ckpt", "inten": "iceberg_msg_all/inten_contr/best.ckpt",
- "ice": {"threads": 2, "batch": 16, "maxNodes": 100, "sparseK": 100},
- "selftest": {"limit": 8, "sha1": "4d067f034fa682928adc6c31e419861d4cbeeef5", "blocking": false}}
+{
+ "job": "canary",
+ "wave": "canary",
+ "W": 5,
+ "N": 7,
+ "chunk": 512,
+ "jobsDataset": "nicholasooo/casmi-c1-pool-jobs",
+ "jobsFile": "jobs_canary.parquet",
+ "dsPrefix": "casmi-c1-pool",
+ "runner": "iceberg_score/pool.sh",
+ "staleMin": 6,
+ "graceMin": 20,
+ "hbMin": 2,
+ "ckptDs": "nicholasooo/casmi-m2-fwdsim-assets",
+ "gen": "iceberg_msg_all/gen/best.ckpt",
+ "inten": "iceberg_msg_all/inten_contr/best.ckpt",
+ "ice": {
+  "threads": 2,
+  "batch": 16,
+  "maxNodes": 100,
+  "sparseK": 100
+ },
+ "selftest": {
+  "file": "selftest.json",
+  "tol": 1e-06
+ },
+ "steal": "any",
+ "srcCommit": ""
+}
