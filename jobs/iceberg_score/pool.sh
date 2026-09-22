@@ -5,7 +5,7 @@
 # writes private dataset nicholasooo/<dsPrefix>-<ID>: every file of the shard's out dir prefixed <job>_s<NN>_ (chunk*.parquet, module summary/scores/pairs, pool_summary.json), one version per finished shard (no checkpoints).
 # manifest: job N W chunk jobsDataset inputs[] module args srcCommit dsPrefix staleMin graceMin hbMin steal ckptDs gen inten ice{threads,batch,maxNodes,sparseK} selftest{file,tol}|{jobsFile,limit,expectedFile,tol}
 set -uo pipefail
-POOL_VER=8   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
+POOL_VER=9   # bump with every change; manifest poolVer/poolUrl make running workers self-update between shards
 : "${ID:?}" "${IDX:?}" "${KAGGLE_API_TOKEN:?}" "${GH_TOKEN:?}"; export GH_TOKEN KAGGLE_API_TOKEN
 REPO=Nicholas022400701/casmi-compute; RAW=https://raw.githubusercontent.com/$REPO/main/pool; MANIFEST_URL=${MANIFEST_URL:-$RAW/manifest.json}; KILL_URL=${KILL_URL:-$RAW/KILL}; PAUSE_IDS_URL=${PAUSE_IDS_URL:-$RAW/PAUSE_ids}
 ROOT=${ROOT:-/data/c1w/ice}; mkdir -p "$ROOT/log" "$ROOT/hb" "$ROOT/ds" && cd "$ROOT"
@@ -21,6 +21,7 @@ d = dict(zip(k, sys.argv[1:])); d['ts'] = time.time(); d['tsUtc'] = time.strftim
 for f in ('idx','chunk','jobsDone','err429','setupSec'): d[f] = int(d[f])
 d['shard'] = None if d['shard'] == '-' else int(d['shard']); d['rate'] = float(d['rate'])
 d['done'] = sorted(set(open('hb/done.txt').read().split())) if os.path.exists('hb/done.txt') else []
+d['ver'] = int(os.environ.get('POOL_VER', 0)); d['cpus'] = os.cpu_count()
 print(json.dumps(d))
 PY
 cat > claim.py <<'PY'
@@ -119,7 +120,7 @@ for i, r in enumerate(d.iter_rows(named=True)):
 print('pass' if (n > 0 and md <= tol and mdz <= tolMz) else 'fail', f'{md:.3g}/mz{mdz:.3g}', n)
 PY
 hb() {  # status [shard] [chunksDone]
-  python hbw.py "$ID" "$IDX" "$JOB" "$1" "${2:--}" "${3:-0}" "$JOBS_DONE" "$RATE" "$ERR429" "$SETUP_SEC" "$SELFTEST" "$KILLTEST$DIE" > hb/hb.json 2>/dev/null || return 0
+  POOL_VER=$POOL_VER python hbw.py "$ID" "$IDX" "$JOB" "$1" "${2:--}" "${3:-0}" "$JOBS_DONE" "$RATE" "$ERR429" "$SETUP_SEC" "$SELFTEST" "$KILLTEST$DIE" > hb/hb.json 2>/dev/null || return 0
   ( cd hb && git add hb.json && { git commit -q --amend -m "hb $ID" >/dev/null 2>&1 || git commit -q -m "hb $ID" >/dev/null 2>&1; } && gitc push -qf origin "HEAD:refs/heads/hb/$ID" >/dev/null 2>&1 ) || log "hb push failed"
 }
 killState() {  # run | pause | kill.  pool/KILL (shared with other families): whole-line KILL or PAUSE = global.  pool/PAUSE_ids (pool.sh only): one worker id per line = pause that worker
@@ -160,6 +161,7 @@ SETUP_SEC=$(( $(date +%s) - T_BOOT )); log "setup done in ${SETUP_SEC}s: $(nproc
 printf '{"title": "%s", "id": "%s", "licenses": [{"name": "other"}]}\n' "$(mget dsPrefix)-$ID" "nicholasooo/$(mget dsPrefix)-$ID" > ds/dataset-metadata.json
 getJobs() {  # download every input of the manifest from jobsDataset (once per job), adapt the ICE job table if the module is runIceberg
   JOBS_DS=$(mget jobsDataset); JOBS_FILE=$(mget jobsFile 2>/dev/null); local f
+  [ "$(cat jobs/.job 2>/dev/null)" = "$JOB $JOBS_DS" ] || { log "inputs for $JOB from $JOBS_DS (clearing cached inputs)"; rm -rf jobs; mkdir -p jobs; echo "$JOB $JOBS_DS" > jobs/.job; }   # job-aware cache: same file names across jobs must not be reused
   for f in $(python -c "import json;m=json.load(open('manifest.json'));print(' '.join(m.get('inputs') or [m['jobsFile']]))"); do
     [ -f "jobs/$f" ] || kaggle datasets download "$JOBS_DS" -f "$f" -p jobs -q --unzip; [ -f "jobs/$f" ] || { log "input missing $JOBS_DS/$f"; return 1; }
   done
