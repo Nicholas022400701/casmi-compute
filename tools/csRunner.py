@@ -11,6 +11,8 @@ Routes: GET  /health
         POST /put?path=<abs>&append=0|1  body = raw bytes    -> {bytes}
         GET  /get?path=<abs>             -> file bytes
         POST /kill?name=<job>            -> kill process group of job
+Jobs run in their own session (setsid) with a jobs/<job>.pid file, so they survive a runner restart and
+/log keeps reporting them correctly.
 """
 import hmac, json, os, signal, subprocess, sys, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +28,24 @@ os.makedirs(JOBS, exist_ok=True)
 T0 = time.time()
 procs = {}
 lock = threading.Lock()
+
+
+def pidOf(n):
+    pidP = os.path.join(JOBS, n + '.pid')
+    try:
+        return int(open(pidP).read().strip())
+    except Exception:
+        return None
+
+
+def isRunning(n):
+    p = procs.get(n)
+    if p is not None:
+        return p.poll() is None
+    pid = pidOf(n)
+    if pid is None:
+        return False
+    return os.path.exists(f'/proc/{pid}') and not os.path.exists(os.path.join(JOBS, n + '.rc'))
 
 
 def jobName(q):
@@ -85,16 +105,13 @@ class H(BaseHTTPRequestHandler):
                 rc = None
                 if os.path.exists(rcP):
                     rc = open(rcP).read().strip()
-                p = procs.get(n)
-                running = p is not None and p.poll() is None
-                self._send(200, {'name': n, 'running': running, 'rc': rc, 'log': log})
+                self._send(200, {'name': n, 'running': isRunning(n), 'rc': rc, 'log': log})
             elif u.path == '/jobs':
                 out = []
                 for f in sorted(os.listdir(JOBS)):
                     if f.endswith('.log'):
                         n = f[:-4]
-                        p = procs.get(n)
-                        out.append({'name': n, 'running': p is not None and p.poll() is None,
+                        out.append({'name': n, 'running': isRunning(n),
                                     'rc': open(os.path.join(JOBS, n + '.rc')).read().strip() if os.path.exists(os.path.join(JOBS, n + '.rc')) else None,
                                     'mtime': int(os.path.getmtime(os.path.join(JOBS, f)))})
                 self._send(200, out)
@@ -123,8 +140,7 @@ class H(BaseHTTPRequestHandler):
             elif u.path == '/start':
                 n = jobName(q)
                 with lock:
-                    p = procs.get(n)
-                    if p is not None and p.poll() is None:
+                    if isRunning(n):
                         self._send(409, {'error': 'job running', 'name': n})
                         return
                     scriptP = os.path.join(JOBS, n + '.sh')
@@ -140,14 +156,17 @@ class H(BaseHTTPRequestHandler):
                     p = subprocess.Popen(['bash', '-lc', wrapper], stdout=logF, stderr=subprocess.STDOUT, cwd=ROOT,
                                          start_new_session=True)
                     procs[n] = p
+                    with open(os.path.join(JOBS, n + '.pid'), 'w') as f:
+                        f.write(str(p.pid))
                 self._send(200, {'name': n, 'pid': p.pid, 'log': logP})
             elif u.path == '/kill':
                 n = jobName(q)
-                p = procs.get(n)
-                if p is None or p.poll() is not None:
+                if not isRunning(n):
                     self._send(200, {'name': n, 'killed': False})
                     return
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                p = procs.get(n)
+                pid = p.pid if p is not None else pidOf(n)
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
                 self._send(200, {'name': n, 'killed': True})
             elif u.path == '/put':
                 p = q['path'][0]
