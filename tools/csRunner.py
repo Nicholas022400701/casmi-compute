@@ -42,10 +42,13 @@ def isRunning(n):
     p = procs.get(n)
     if p is not None:
         return p.poll() is None
-    pid = pidOf(n)
-    if pid is None:
+    if os.path.exists(os.path.join(JOBS, n + '.rc')):
         return False
-    return os.path.exists(f'/proc/{pid}') and not os.path.exists(os.path.join(JOBS, n + '.rc'))
+    pid = pidOf(n)
+    if pid is None:  # job started by an earlier runner instance (no pid file): look for its script process
+        r = subprocess.run(['pgrep', '-f', f'{JOBS}/{n}.sh'], capture_output=True)
+        return r.returncode == 0
+    return os.path.exists(f'/proc/{pid}')
 
 
 def jobName(q):
