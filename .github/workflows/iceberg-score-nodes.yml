@@ -1,0 +1,60 @@
+# Variant of iceberg-score-ckpt.yml with a selectable fragmentation-DAG size (workflow_dispatch allows 10 inputs, so `maxNodes` replaces `ckpt`; checkpoints fixed to msg_all, chunk fixed 512). E1b, S4 3.3 read.
+# ICEBERG CPU scoring of a sharded job table (private Kaggle dataset) -> one private Kaggle dataset per shard (nicholasooo/<dsprefix>-sNN).
+# One matrix job per shard, each running jobs/iceberg_score/shard.sh (same module, pinned source snapshot, checkpoints, md5-verified inputs
+# and output layout as the sandbox pool's pool.sh / kernel kpool.sh, so downstream compare/merge does not care about the source).
+# Logs print counts and timings only — never SMILES, keys or tokens. Account-wide cap (GitHub Pro): 40 concurrent jobs across all workflows.
+name: iceberg-score-nodes
+on:
+  workflow_dispatch:
+    inputs:
+      shards:   {description: 'JSON list of shard ids, e.g. [28] or [1,15,21]', required: true}
+      n:        {description: 'number of shards the job table is split into', required: true, default: '100'}
+      job:      {description: 'job name / output tag (file prefix <job>_sNN_)', required: true, default: 'ranker'}
+      jobsDs:   {description: 'private Kaggle dataset holding the job table', required: true, default: 'nicholasooo/casmi-m2-ranker-jobs'}
+      inputs:   {description: 'comma list of files to fetch from jobsDs into jobs/', required: true, default: 'rows.parquet,queries.parquet,plan.json'}
+      jobsMd5:  {description: 'optional comma list file=md5 pins; any mismatch aborts the shard (D78)', required: false, default: ''}
+      args:     {description: 'module args (empty = ranker default: --rows jobs/rows.parquet --queries jobs/queries.parquet --head all --tag <job>)', required: false, default: ''}
+      dsprefix: {description: 'output dataset prefix -> nicholasooo/<dsprefix>-sNN', required: true}
+      threads:  {description: 'torch threads (ubuntu-latest has 4 vCPU)', required: false, default: '4'}
+      maxNodes: {description: 'ICEBERG max_nodes (fragmentation DAG size; kernel uses 100)', required: true, default: '100'}
+permissions:
+  contents: read
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    name: shard ${{ matrix.shard }}
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      CASMI_ENC_KEY: ${{ secrets.CASMI_ENC_KEY }}
+      JOB: ${{ inputs.job }}
+      SHARD: ${{ matrix.shard }}
+      N: ${{ inputs.n }}
+      JOBS_DS: ${{ inputs.jobsDs }}
+      INPUTS: ${{ inputs.inputs }}
+      JOBS_MD5: ${{ inputs.jobsMd5 }}
+      ARGS: ${{ inputs.args }}
+      DSPREFIX: ${{ inputs.dsprefix }}
+      THREADS: ${{ inputs.threads }}
+      CHUNK: '512'
+      CKPT: 'nicholasooo/casmi-m2-fwdsim-assets,iceberg_msg_all/gen/best.ckpt,iceberg_msg_all/inten_contr/best.ckpt'
+      MAXNODES: ${{ inputs.maxNodes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: score shard
+        run: |
+          IFS=, read -r CKPT_DS GEN INTEN <<< "$CKPT"; export CKPT_DS GEN INTEN
+          echo "ckpt set: $CKPT_DS $GEN $INTEN; maxNodes $MAXNODES"
+          bash jobs/iceberg_score/shard.sh
+      - uses: actions/upload-artifact@v4   # only exists when the Kaggle publish failed: encrypted copy of the shard output
+        if: always()
+        with:
+          name: enc-${{ inputs.job }}-s${{ matrix.shard }}
+          path: /home/runner/ice/art/
+          retention-days: 3
+          if-no-files-found: ignore
