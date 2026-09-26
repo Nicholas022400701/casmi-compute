@@ -11,6 +11,6 @@ n=0; dup=0; for f in $(find "$ART" -name '*.tar.zst.enc' | sort); do S=$(basenam
   while IFS= read -r -d '' x; do rel=${x#$T/}; b=$(basename "$rel"); if [ -e "$ROOT/ds/$b" ]; then mv "$x" "$ROOT/ds/${S}_$b"; dup=$((dup+1)); else mv "$x" "$ROOT/ds/$b"; fi; done < <(find "$T" -type f -print0); n=$((n+1)); done; log "name collisions resolved with shard prefix: $dup"
 log "shards collected: $n; files $(find "$ROOT/ds" -type f | wc -l); $(du -sm "$ROOT/ds" | cut -f1) MB"; [ "$n" -gt 0 ] || { log "nothing to publish"; exit 1; }
 printf '{"title": "%s", "id": "nicholasooo/%s", "licenses": [{"name": "other"}]}\n' "$OUT_DS" "$OUT_DS" > "$ROOT/ds/dataset-metadata.json"
-R=$($K datasets create -p "$ROOT/ds" -q --dir-mode zip 2>&1); case "$R" in *rror*|*exists*|*already*) R=$($K datasets version -p "$ROOT/ds" -q --dir-mode zip -m "collect $(date -u +%H:%M) run ${GITHUB_RUN_ID:-local}" 2>&1);; esac; log "publish: ${R: -120}"
-for i in $(seq 1 20); do sleep 30; $K datasets files "nicholasooo/$OUT_DS" --page-size 500 2>/dev/null | grep -q '_gha_' && { log "dataset ready: nicholasooo/$OUT_DS"; exit 0; }; done
-log "dataset not verified yet (may still be processing): nicholasooo/$OUT_DS"; exit 0
+R=$($K datasets create -p "$ROOT/ds" -q --dir-mode zip 2>&1); case "$R" in *rror*|*exists*|*already*) R=$($K datasets version -p "$ROOT/ds" -q --dir-mode zip -m "collect $(date -u +%H:%M) run ${GITHUB_RUN_ID:-local}" 2>&1);; esac; log "publish: $(echo "$R" | sed -E "s#https?://[^ ]+#<url>#g; s#nicholasooo/[A-Za-z0-9_.-]+#<ds>#g; s#$OUT_DS#<ds>#g" | tr "\n" " " | tail -c 120)"   # public log: URLs and slugs redacted
+for i in $(seq 1 20); do sleep 30; $K datasets files "nicholasooo/$OUT_DS" --page-size 500 2>/dev/null | grep -q '_gha_' && { log "dataset ready"; exit 0; }; done
+log "dataset not verified yet (may still be processing)"; exit 0
