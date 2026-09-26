@@ -2,6 +2,7 @@
 # each shard's output dir is encrypted (aes-256-cbc, repo secret) into an artifact, and a final collect job publishes ALL shards into ONE private Kaggle dataset.
 # The script must need no secrets and print counts/timings only (its log is filtered anyway). Account-wide cap: 40 concurrent jobs across all workflows.
 name: run-script
+run-name: ${{ inputs.envx }} shards ${{ inputs.shards }} n${{ inputs.n }}   # self-identifying runs for concurrent dispatchers (cell id + shard list; no dataset slugs — M3b/M2b 14:2x)
 on:
   workflow_dispatch:
     inputs:
