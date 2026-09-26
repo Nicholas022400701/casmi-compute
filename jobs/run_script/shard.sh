@@ -10,7 +10,10 @@ mkdir -p "$ROOT/bundle" "$ROOT/art" && cd "$ROOT"
 export PATH=$HOME/.local/bin:$PATH; which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
 which zstd >/dev/null 2>&1 || sudo apt-get install -y -qq zstd >/dev/null 2>&1
 uv venv -q --python 3.12 kvenv && uv pip install -q --python kvenv/bin/python kaggle; K=$ROOT/kvenv/bin/kaggle   # kaggle CLI in its own venv; system python/pip stay untouched for the bundle's run.sh
-$K datasets download "$BUNDLE_DS" -p bundle --unzip -q >/dev/null 2>&1 || { log "bundle download failed"; exit 1; }   # kaggle CLI prints "Dataset URL: ..." even with -q; public log gets counts only
+# bundle download with backoff: a fleet starting at once gets 429s from Kaggle (13:18 + 13:25 fleets: 47 of 64 shards failed in < 10 s). kaggle CLI prints "Dataset URL: ..." even with -q -> output kept in a file, only the error class is logged
+ok=0; for a in 1 2 3 4 5 6 7 8; do $K datasets download "$BUNDLE_DS" -p bundle --unzip -q > "$ROOT/dl.log" 2>&1 && { ok=1; break; }
+  log "bundle download attempt $a failed: $(grep -oiE '429|too many requests|403|forbidden|401|unauthori[sz]ed|404|not found|timed? ?out|connection|no such' "$ROOT/dl.log" | head -1)"; rm -rf bundle/*; sleep $(( 20*a + RANDOM % 30 )); done
+[ "$ok" = 1 ] || { log "bundle download failed after 8 attempts"; exit 1; }
 log "bundle: $(find bundle -type f | wc -l) files, $(du -sm bundle | cut -f1) MB; $(nproc) cpus; setup $(( $(date +%s) - T0 ))s"
 cd bundle; [ -f run.sh ] || { log "run.sh missing in bundle"; exit 1; }
 T1=$(date +%s); env $ENVX SHARD="$SHARD" N="$N" PROCS="$PROCS" bash -c "$CMD" > "$ROOT/script.log" 2>&1; RC=$?; WALL=$(( $(date +%s) - T1 ))
