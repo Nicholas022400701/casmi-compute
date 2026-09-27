@@ -2,6 +2,9 @@
 # run_script/collect.sh — decrypt all shard artifacts (art/*/sNN.tar.zst.enc) into one folder and publish ONE private Kaggle dataset nicholasooo/<OUT_DS> (create, or new version if it exists).
 set -uo pipefail
 : "${KAGGLE_API_TOKEN:?}" "${CASMI_ENC_KEY:?}" "${OUT_DS:?}"; export KAGGLE_API_TOKEN CASMI_ENC_KEY; ROOT=${ROOT:-${RUNNER_TEMP:-/tmp}/rs}; ART=${ART:-art}
+# M3b 22:4x UTC 09-27 (ORCH order after two mis-slugged landings): OUT_DS must be a bare slug. A dispatcher that passed the full ref "nicholasooo/<slug>" (M3b, prp1 15:22 and pf1 18:29 UTC 09-27) produced
+# id "nicholasooo/nicholasooo/<slug>" -> Kaggle created/versioned the dataset nicholasooo/nicholasooo (title "nicholasooo/casmi-m3b-gha-prp1"; it now holds prp1 = v1, pf1 = v2). Normalise a leading owner, then refuse anything that is not a slug.
+OUT_DS=${OUT_DS#nicholasooo/}; [[ "$OUT_DS" =~ ^[a-z0-9][a-z0-9-]{2,49}$ ]] || { echo "[collect] REFUSED: OUT_DS '$OUT_DS' is not a bare dataset slug (lowercase letters, digits, hyphens; no owner, no slash) - re-run with collectRun=$GITHUB_RUN_ID and a proper outDs" >&2; exit 1; }
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 mkdir -p "$ROOT/ds" && export PATH=$HOME/.local/bin:$PATH; which uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
 which zstd >/dev/null 2>&1 || sudo apt-get install -y -qq zstd >/dev/null 2>&1
@@ -11,6 +14,8 @@ n=0; dup=0; for f in $(find "$ART" -name '*.tar.zst.enc' | sort); do S=$(basenam
   while IFS= read -r -d '' x; do rel=${x#$T/}; b=$(basename "$rel"); if [ -e "$ROOT/ds/$b" ]; then mv "$x" "$ROOT/ds/${S}_$b"; dup=$((dup+1)); else mv "$x" "$ROOT/ds/$b"; fi; done < <(find "$T" -type f -print0); n=$((n+1)); done; log "name collisions resolved with shard prefix: $dup"
 log "shards collected: $n; files $(find "$ROOT/ds" -type f | wc -l); $(du -sm "$ROOT/ds" | cut -f1) MB"; [ "$n" -gt 0 ] || { log "nothing to publish"; exit 1; }
 printf '{"title": "%s", "id": "nicholasooo/%s", "licenses": [{"name": "other"}]}\n' "$OUT_DS" "$OUT_DS" > "$ROOT/ds/dataset-metadata.json"
-R=$($K datasets create -p "$ROOT/ds" -q --dir-mode zip 2>&1); case "$R" in *rror*|*exists*|*already*) R=$($K datasets version -p "$ROOT/ds" -q --dir-mode zip -m "collect $(date -u +%H:%M) run ${GITHUB_RUN_ID:-local}" 2>&1);; esac; log "publish: $(echo "$R" | sed -E "s#https?://[^ ]+#<url>#g; s#nicholasooo/[A-Za-z0-9_.-]+#<ds>#g; s#$OUT_DS#<ds>#g" | tr "\n" " " | tail -c 120)"   # public log: URLs and slugs redacted
-for i in $(seq 1 20); do sleep 30; $K datasets files "nicholasooo/$OUT_DS" --page-size 500 2>/dev/null | grep -q '_gha_' && { log "dataset ready"; exit 0; }; done
-log "dataset not verified yet (may still be processing)"; exit 0
+R=$($K datasets create -p "$ROOT/ds" -q --dir-mode zip 2>&1); case "$R" in *rror*|*exists*|*already*) R=$($K datasets version -p "$ROOT/ds" -q --dir-mode zip -m "collect $(date -u +%H:%M) run ${GITHUB_RUN_ID:-local}" 2>&1);; esac; log "publish: $(echo "$R" | tail -c 300)"
+# assert the dataset Kaggle reports back is exactly the requested one (the create/version output carries the URL .../datasets/<owner>/<slug>); fail LOUDLY otherwise
+got=$(echo "$R" | grep -o 'kaggle.com/datasets/[A-Za-z0-9_-]*/[A-Za-z0-9_-]*' | head -1 | sed 's#kaggle.com/datasets/##'); if [ -n "$got" ] && [ "$got" != "nicholasooo/$OUT_DS" ]; then log "SLUG MISMATCH: requested nicholasooo/$OUT_DS, Kaggle returned $got - outputs landed in the wrong dataset; re-collect with collectRun=${GITHUB_RUN_ID:-?}"; exit 1; fi; [ -n "$got" ] || log "publish output carried no dataset URL (response above); verifying by listing files"
+for i in $(seq 1 20); do sleep 30; $K datasets files "nicholasooo/$OUT_DS" --page-size 500 2>/dev/null | grep -q '_gha_' && { log "dataset ready: nicholasooo/$OUT_DS (slug verified)"; exit 0; }; done
+st=$($K datasets status "nicholasooo/$OUT_DS" 2>&1 | tail -1); log "dataset nicholasooo/$OUT_DS not verified after 10 min: status '$st' (files not listed yet) - FAILING LOUDLY so the landing is never assumed; if the status is ready/processing the files usually appear a few minutes later (check by hand), otherwise re-collect with collectRun=${GITHUB_RUN_ID:-?}"; exit 1
