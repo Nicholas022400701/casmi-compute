@@ -315,16 +315,38 @@ top = pmZ.sort_values('best', ascending=False).head(50).copy(); top['best'] = to
 
 # ---- 10. outputs: Z library (all columns + train-like), keys, licence note, report ----
 pq.write_table(ZTz, os.path.join(A.out, 'Z_library.parquet'), compression='zstd')
-off, mz, it = LZ['off'], LZ['mz'], LZ['it']; mzL = pa.ListArray.from_arrays(pa.array(off, pa.int32()), pa.array(mz.astype(np.float64))); itL = pa.ListArray.from_arrays(pa.array(off, pa.int32()), pa.array(it.astype(np.float64)))
-cols = {'ingest_lib': pa.array(['enveda-180-zenodo'] * ZTz.num_rows), 'normalized_smiles': ZTz.column(S['smiles']).cast(pa.string()) if S['smiles'] else pa.array([None] * ZTz.num_rows, pa.string()),
-        'inchikey': ZTz.column(S['key']).cast(pa.string()), 'inchikey14': pa.array(LZ['ik'].tolist()), 'adduct': pa.array([k if k else a for k, a in zip(LZ['kAdd'].tolist(), LZ['add'].tolist())]), 'adduct_orig': pa.array(LZ['add'].tolist()), 'hostKeptAdduct': pa.array(LZ['kept'].tolist()), 'precursor_mz': pa.array(LZ['prec']),
-        'ms2_mzs': mzL, 'ms2_normalized_intensities': itL, 'num_peaks': pa.array(LZ['npk'].astype(np.int64)), 'neutral_mass': pa.array(LZ['nm'])}
-if S['pol']: cols['ionization_mode'] = ZTz.column(S['pol']).cast(pa.string())
-if S['ce']: cols['collision_energy_orig'] = ZTz.column(S['ce']).cast(pa.string())
-pq.write_table(pa.table(cols), os.path.join(A.out, 'Z_trainlike.parquet'), compression='zstd')
+# kernel-ready file: ONLY rows whose adduct maps into the kernel vocabulary (same polarity, formula-consistent), the six library columns FIRST with train.parquet's exact dtypes
+# (string / double / list<element: double>), intensities base-peak-normalised like train (raw max kept in base_peak_intensity), then provenance columns
+kmask = np.array([bool(k) for k in LZ['kAdd']]); sel = np.flatnonzero(kmask); LST = pa.list_(pa.field('element', pa.float64()))
+def rows_lists(idx, vals, norm=False):
+    out, off = [], [0]
+    for i in idx:
+        a, b = LZ['off'][i], LZ['off'][i + 1]; v = vals[a:b].astype(np.float64)
+        if norm and v.size and v.max() > 0: v = v / v.max()
+        out.append(v); off.append(off[-1] + v.size)
+    return pa.ListArray.from_arrays(pa.array(np.asarray(off, np.int32)), pa.array(np.concatenate(out) if out else np.zeros(0))).cast(LST)
+bpi = np.array([float(LZ['it'][LZ['off'][i]:LZ['off'][i + 1]].max()) if LZ['off'][i + 1] > LZ['off'][i] else np.nan for i in sel])
+smiAll = ZTz.column(S['smiles']).cast(pa.string()).to_pylist() if S['smiles'] else [None] * ZTz.num_rows
+cols = {'inchikey14': pa.array([LZ['ik'][i] for i in sel], pa.string()), 'normalized_smiles': pa.array([smiAll[i] for i in sel], pa.string()), 'adduct': pa.array([LZ['kAdd'][i] for i in sel], pa.string()),
+        'precursor_mz': pa.array(LZ['prec'][sel].astype(np.float64), pa.float64()), 'ms2_mzs': rows_lists(sel, LZ['mz']), 'ms2_normalized_intensities': rows_lists(sel, LZ['it'], norm=True),
+        'base_peak_intensity': pa.array(bpi, pa.float64()), 'num_peaks': pa.array(LZ['npk'][sel].astype(np.int64)), 'ingest_lib': pa.array(['enveda-180-zenodo'] * len(sel), pa.string()),
+        'inchikey': pa.array([ZTz.column(S['key']).cast(pa.string()).to_pylist()[i] for i in sel], pa.string()), 'adduct_orig': pa.array([LZ['add'][i] for i in sel], pa.string()), 'hostKeptAdduct': pa.array([bool(LZ['kept'][i]) for i in sel]),
+        'neutral_mass': pa.array(LZ['nm'][sel].astype(np.float64), pa.float64())}
+if S['pol']: cols['ionization_mode'] = pa.array([ZTz.column(S['pol']).cast(pa.string()).to_pylist()[i] for i in sel], pa.string())
+if S['ce']: cols['collision_energy_orig'] = pa.array([ZTz.column(S['ce']).cast(pa.string()).to_pylist()[i] for i in sel], pa.string())
+KT = pa.table(cols); kfile = 'Z_trainlike.parquet'; pq.write_table(KT, os.path.join(A.out, kfile), compression='zstd')
+trSch = pq.read_schema(A.train); six = ['inchikey14', 'normalized_smiles', 'adduct', 'precursor_mz', 'ms2_mzs', 'ms2_normalized_intensities']
+kkeys = set(KT.column('inchikey14').to_pylist()); assert not (kkeys & trainKeys), 'kernel file holds a train key'
+R['kernelFile'] = dict(file=kfile, md5=md5(os.path.join(A.out, kfile)), rows=KT.num_rows, keys=len(kkeys), rowsDroppedNoKernelAdduct=int(ZTz.num_rows - KT.num_rows), keysInTrain=len(kkeys & trainKeys),
+                       dtypesEqualTrain={c: bool(KT.schema.field(c).type == trSch.field(c).type) for c in six}, dtypes={c: str(KT.schema.field(c).type) for c in KT.schema.names},
+                       adductVocab=collections.Counter(KT.column('adduct').to_pylist()).most_common(), adductsOutsideKernelTable=sorted(set(KT.column('adduct').to_pylist()) - set(ns['ADDUCTS'])), hostKeptRows=int(sum(KT.column('hostKeptAdduct').to_pylist())), licence='CC BY 4.0')
+R['licence'] = 'CC BY 4.0 (Enveda-180, Zenodo 21346580 v3 2026-07-13); modified subset, see README_LICENSE.txt'
+log(f'kernel file: {KT.num_rows:,} rows / {len(kkeys):,} keys, dropped {R["kernelFile"]["rowsDroppedNoKernelAdduct"]:,} rows without a kernel adduct; dtypes equal train {all(R["kernelFile"]["dtypesEqualTrain"].values())}')
 open(os.path.join(A.out, 'Z_keys.txt'), 'w').write('\n'.join(Z) + '\n')
 open(os.path.join(A.out, 'README_LICENSE.txt'), 'w').write('Enveda-180 (Krettler et al., Enveda Biosciences), Zenodo record 21346580 (v3, 2026-07-13), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). '
     'MODIFIED: Z_library.parquet / Z_trainlike.parquet hold only the rows whose InChIKey first block is absent from the CASMI26 competition train.parquet; Z_trainlike renames columns to the train.parquet layout (intensities as published). Counts in report.json.\n')
 R['outputs'] = {f: dict(md5=md5(os.path.join(A.out, f)), bytes=os.path.getsize(os.path.join(A.out, f))) for f in os.listdir(A.out) if f != 'report.json'}
+dup = set(perKey.index[perKey >= 0.99]); R['Z_summary'] = dict(Z_keys=len(Zset), keysWithKernelAdductRow=len(kkeys), keysWithHostKeptAdductRow=len(Zk), keysDuplicateSpectrumInTrainGe099=len(dup & Zset), keysStdCollapseIntoTrain=R['Z_standardise'].get('stdKeyInTrain'),
+                      proposal_genuinelyNew=len(Zset) - len(dup & Zset) - (R['Z_standardise'].get('stdKeyInTrain') or 0), note='genuinelyNew = Z keys minus keys with a >= 0.99 duplicate spectrum in train minus keys whose salt-stripped/uncharged form is a train key (overlap of the two not removed twice only if disjoint; see components)')
 R['wallSec'] = round(time.time() - T0, 1); json.dump(R, open(os.path.join(A.out, 'report.json'), 'w'), indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))
 log(f'done: Z {len(Z):,} keys / {ZTz.num_rows:,} spectra; test molecules >= gate: Z {R["test_vs_Z"]["moleculesGeGate"]} vs control mean {R["test_vs_control_mean"]}; wall {R["wallSec"]} s')
