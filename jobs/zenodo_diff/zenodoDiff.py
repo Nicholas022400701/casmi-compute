@@ -6,10 +6,17 @@ What it writes (out/): report.json (counts, quantiles, histograms, md5s), top50.
 structures absent from train, all columns), Z_trainlike.parquet (same rows, train.parquet column names), Z_keys.txt, README_LICENSE.txt.
 Log rule (public runner): counts and timings only — no identifiers, no structures."""
 import argparse, hashlib, json, os, sys, time, collections
+if int(os.environ.get('ZD_PROCS', '1') or 1) > 1: os.environ.setdefault('NUMBA_THREADING_LAYER', 'workqueue')
 import numpy as np, pandas as pd, pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import kernelBits
 T0 = time.time()
-def log(*a): print(f'[{time.strftime("%H:%M:%S")} +{time.time()-T0:.0f}s]', *a, flush=True)
+def rss():
+    try:
+        for ln in open('/proc/self/status'):
+            if ln.startswith('VmRSS'): return f'{int(ln.split()[1]) / 1048576:.1f}G'
+    except Exception: pass
+    return '?'
+def log(*a): print(f'[{time.strftime("%H:%M:%S")} +{time.time()-T0:.0f}s rss {rss()}]', *a, flush=True)
 def md5(p):
     h = hashlib.md5()
     with open(p, 'rb') as f:
@@ -34,14 +41,20 @@ GATE = float(ns['ICE_LIB_GATE']); R['kernel'] = dict(baseMd5=md5(os.path.join(A.
 log(f'kernel helpers loaded: gate {GATE}, window {CFG.PPM_WIN} ppm, tol {CFG.MZ_TOL}')
 
 # ---- 2. train keys + the kernel-style library over train rows ----
-def build_lib(tab, keyCol, smiCol, addCol, precCol, mzCol, itCol, extra=None):
-    mzc = tab.column(mzCol).combine_chunks(); itc = tab.column(itCol).combine_chunks()
-    off = mzc.offsets.to_numpy().astype(np.int64); allmz = mzc.values.to_numpy(zero_copy_only=False).astype(np.float32); allin = itc.values.to_numpy(zero_copy_only=False).astype(np.float32)
-    prec = tab.column(precCol).to_numpy(zero_copy_only=False).astype(np.float64); add = np.asarray(tab.column(addCol).cast(pa.string()).to_pylist(), dtype=object)
-    ik = np.asarray(tab.column(keyCol).cast(pa.string()).to_pylist(), dtype=object)
+def build_lib_stream(pf, rgs, keyCol, addCol, precCol, mzCol, itCol, extra=None, batch=100_000):
+    """kernel-style flat library from a parquet file, streamed per batch (no whole-table copy): offsets int64, mz/it float32, nm float64, ik/add object."""
+    mzs, its, lens, precs, iks, adds = [], [], [], [], [], []; ex = {k: [] for k in (extra or {})}
+    for b in pf.iter_batches(batch_size=batch, row_groups=rgs, columns=[keyCol, addCol, precCol, mzCol, itCol] + list((extra or {}).values())):
+        m, i = b.column(mzCol), b.column(itCol)
+        lens.append(pc.fill_null(pc.list_value_length(m), 0).to_numpy(zero_copy_only=False).astype(np.int64)); mzs.append(m.flatten().to_numpy(zero_copy_only=False).astype(np.float32)); its.append(i.flatten().to_numpy(zero_copy_only=False).astype(np.float32))
+        precs.append(b.column(precCol).to_numpy(zero_copy_only=False).astype(np.float64)); iks.append(np.asarray(b.column(keyCol).cast(pa.string()).to_pylist(), dtype=object)); adds.append(np.asarray(b.column(addCol).cast(pa.string()).to_pylist(), dtype=object))
+        for k, c in (extra or {}).items(): ex[k].append(np.asarray(b.column(c).cast(pa.string()).to_pylist(), dtype=object))
+        del b, m, i
+    allmz = np.concatenate(mzs); del mzs; allin = np.concatenate(its); del its; npk = np.concatenate(lens); off = np.concatenate([[0], np.cumsum(npk)]).astype(np.int64)
+    prec = np.concatenate(precs); ik = np.concatenate(iks); add = np.concatenate(adds)
     nm = neutral_mass(prec, add); ok = np.isfinite(nm); order = np.argsort(np.where(ok, nm, 1e18), kind='mergesort')
-    L = dict(off=off, mz=allmz, it=allin, nm=nm, ik=ik, order=order, snm=nm[order], n_ok=int(ok.sum()), npk=np.diff(off))
-    if extra: L.update({k: np.asarray(tab.column(c).cast(pa.string()).to_pylist(), dtype=object) for k, c in extra.items()})
+    L = dict(off=off, mz=allmz, it=allin, nm=nm, ik=ik, order=order, snm=nm[order], n_ok=int(ok.sum()), npk=npk, prec=prec)
+    for k in ex: L[k] = np.concatenate(ex[k])
     return L
 tf = pq.ParquetFile(A.train); rgs = list(range(tf.metadata.num_row_groups if not A.trainRowGroups else min(A.trainRowGroups, tf.metadata.num_row_groups)))
 tk = tf.read_row_groups(rgs, columns=['inchikey14', 'ingest_lib', 'adduct'])
@@ -51,8 +64,8 @@ e180RowsPerKey = pd.Series(pc.filter(tk.column('inchikey14'), e180mask).to_pylis
 R['train'] = dict(rows=tk.num_rows, rowGroups=len(rgs), keys=len(trainKeys), e180Rows=int(pc.sum(e180mask).as_py()), e180Keys=len(e180Keys), libs=dict(collections.Counter(tk.column('ingest_lib').to_pylist()).most_common()),
                   e180Adducts=e180AdductCounts.most_common(), keptAdductsInKernelTable=sorted(keptAdducts))
 log(f'train: {tk.num_rows:,} rows, {len(trainKeys):,} keys, e180 keys {len(e180Keys):,}')
-tl = tf.read_row_groups(rgs, columns=['inchikey14', 'normalized_smiles', 'adduct', 'precursor_mz', 'ms2_mzs', 'ms2_normalized_intensities', 'ingest_lib'])
-Ltr = build_lib(tl, 'inchikey14', 'normalized_smiles', 'adduct', 'precursor_mz', 'ms2_mzs', 'ms2_normalized_intensities', extra=dict(lib='ingest_lib')); del tl
+del tk
+Ltr = build_lib_stream(tf, rgs, 'inchikey14', 'adduct', 'precursor_mz', 'ms2_mzs', 'ms2_normalized_intensities', extra=dict(lib='ingest_lib'))
 R['train'].update(libSpectra=int(len(Ltr['off']) - 1), libFiniteNm=Ltr['n_ok']); log(f'train library: {len(Ltr["off"])-1:,} spectra, finite nm {Ltr["n_ok"]:,}')
 
 # ---- 3. the release: schema sniffing ----
@@ -127,24 +140,30 @@ BIG = {S['smiles'], 'iupac_name', 'enamine_catalog_id', 'pubchem_cid', 'adduct_f
 scalarCols = [n for n in S['names'] if not (pa.types.is_list(zf.schema_arrow.field(n).type) or pa.types.is_large_list(zf.schema_arrow.field(n).type) or pa.types.is_struct(zf.schema_arrow.field(n).type)) and n not in BIG]
 listCol = S['peaks'][1] if S['peaks'][0] in ('lists', 'structs') else None
 numCols, catCols = [], []
-parts = []
+# memory-lean pass 1: per batch -> ik14 (arrow string), numeric columns float32, categorical columns as arrow string chunks (dictionary-encoded at the end), titleIdx float64
+kind = {}; chunks = collections.defaultdict(list); nRows = 0
+def _num(col):
+    if pa.types.is_floating(col.type) or pa.types.is_integer(col.type): return col.to_numpy(zero_copy_only=False).astype(np.float32), 1.0
+    f = pd.to_numeric(pd.Series(col.to_numpy(zero_copy_only=False), dtype='object'), errors='coerce'); return f.to_numpy(dtype=np.float32, na_value=np.nan), float(f.notna().mean())
 for b in zf.iter_batches(batch_size=200_000, columns=scalarCols + ([listCol] if (listCol and 'num_peaks' not in scalarCols) else [])):
-    d = {}
     for c in scalarCols:
         col = b.column(c)
-        if c == S['key']: d['ik14'] = pd.Series([x[:14] if x else '' for x in col.to_pylist()], dtype='string'); continue
-        if c == S['title']:
-            d['titleIdx'] = pd.to_numeric(pd.Series(col.to_pylist()).astype(str).str.extract(r'(\d+)')[0], errors='coerce').astype('float64'); continue
-        if pa.types.is_floating(col.type) or pa.types.is_integer(col.type): d[c] = col.to_numpy(zero_copy_only=False).astype('float64'); numCols.append(c); continue
-        v = pd.Series(col.to_pylist(), dtype='object')
-        f = pd.to_numeric(v, errors='coerce')
-        if f.notna().mean() > 0.9: d[c] = f.astype('float32'); numCols.append(c)
-        else: d[c] = v.astype('category'); catCols.append(c)
-    d = pd.DataFrame(d)
-    d['nPeaks'] = d['num_peaks'] if 'num_peaks' in d else (pc.list_value_length(b.column(listCol)).to_numpy(zero_copy_only=False) if listCol else -1)
-    parts.append(d)
-M = pd.concat(parts, ignore_index=True); del parts; numCols = sorted(set(numCols)); catCols = sorted(set(catCols))
-for c in catCols: M[c] = M[c].astype('string')
+        if c == S['key']: chunks['ik14'].append(pc.fill_null(pc.utf8_slice_codeunits(col.cast(pa.string()), 0, 14), '')); continue
+        if c == S['title']: chunks['titleIdx'].append(pd.to_numeric(pd.Series(col.cast(pa.string()).to_numpy(zero_copy_only=False), dtype='object').str.extract(r'(\d+)')[0], errors='coerce').to_numpy(dtype=np.float64, na_value=np.nan)); continue
+        if c not in kind:
+            v, share = _num(col); kind[c] = 'num' if share > 0.9 else 'cat'
+        if kind[c] == 'num': chunks[c].append(_num(col)[0])
+        else: chunks[c].append(col.cast(pa.string()))
+    chunks['nPeaks'].append(b.column('num_peaks').to_numpy(zero_copy_only=False).astype(np.int32) if 'num_peaks' in scalarCols else (pc.list_value_length(b.column(listCol)).to_numpy(zero_copy_only=False).astype(np.int32) if listCol else np.full(b.num_rows, -1, np.int32)))
+    nRows += b.num_rows; del b
+numCols = sorted(c for c in kind if kind[c] == 'num'); catCols = sorted(c for c in kind if kind[c] == 'cat')
+M = pd.DataFrame(index=pd.RangeIndex(nRows))
+M['ik14'] = pd.Series(pa.chunked_array(chunks.pop('ik14')), dtype=pd.ArrowDtype(pa.string()), index=M.index)
+for c in numCols + ['nPeaks']: M[c] = np.concatenate(chunks.pop(c))
+if 'titleIdx' in chunks: M['titleIdx'] = np.concatenate(chunks.pop('titleIdx'))
+for c in catCols: M[c] = pa.chunked_array(chunks.pop(c)).dictionary_encode().unify_dictionaries().to_pandas(); M[c] = M[c].astype('category') if not isinstance(M[c].dtype, pd.CategoricalDtype) else M[c]
+del chunks
+log(f'pass 1: {nRows:,} rows, {len(numCols)} numeric + {len(catCols)} categorical columns')
 def polarity_of(addStr, modeStr=None):
     """'+' / '-' per row from the adduct string's trailing sign, else from an ion-mode string; '' when unknown."""
     out = np.array([(a.strip()[-1] if isinstance(a, str) and a.strip() and a.strip()[-1] in '+-' else '') for a in addStr], dtype=object)
@@ -168,7 +187,7 @@ R['adductMap'] = dict(polarity=collections.Counter(M['pol'].tolist()).most_commo
 log(f'adducts: {R["adductMap"]["rowsWithKernelAdduct"]:,} rows map to a kernel adduct, {R["adductMap"]["rowsKeptAdduct"]:,} to a host-kept one')
 M['inTrain'] = M['ik14'].isin(trainKeys); M['inE180'] = M['ik14'].isin(e180Keys)
 if 'titleIdx' in M and M['titleIdx'].notna().any(): numCols.append('titleIdx')
-relKeys = set(M['ik14']); Z = sorted(relKeys - trainKeys); Zfull = len(Z)
+relKeys = set(M['ik14'].unique().tolist()) - {''}; Z = sorted(relKeys - trainKeys); Zfull = len(Z)
 if A.maxZ: Z = Z[:A.maxZ]
 Zset = set(Z)
 R['diff'] = dict(releaseKeys=len(relKeys), releaseRows=len(M), Z_keys=Zfull, Z_keysUsed=len(Z), Z_rows=int((~M['inTrain']).sum()), keysInTrain=len(relKeys & trainKeys), keysInE180=len(relKeys & e180Keys),
@@ -208,27 +227,27 @@ def profile(d):
     return out
 zm = M['ik14'].isin(Zset); zkm = M['ik14'].isin(set(Zk)) & M['kept']; R['profile'] = dict(Z=profile(M[zm]), Zkept_keptRows=profile(M[zkm]) if zkm.any() else None, rest=profile(M[~zm].sample(min(300_000, int((~zm).sum())), random_state=0)), restKeptRows=profile(M[(~zm) & M['kept']].sample(min(300_000, int(((~zm) & M['kept']).sum())), random_state=0)))
 if 'inFiltered' in M: R['profile']['Z_filteredShare'] = round(float(M.loc[zm, 'inFiltered'].mean()), 4); R['profile']['rest_filteredShare'] = round(float(M.loc[~zm, 'inFiltered'].mean()), 4)
-log('profiles done')
+del M, zm, zkm; log('profiles done')
 
 # ---- 6. pass 2: the spectra of Z (library) and of the control draws (train keys present in the release) ----
 rng = np.random.default_rng(A.seed); poolCtl = sorted(relKeys & trainKeys)
 # the visible test file's molecules are train copies -> resolve their keys by exact spectrum identity so that the controls never contain them
 te = pq.read_table(A.test).to_pandas(); teKeys = set()
 precIdx = collections.defaultdict(list)
-for i, (p, k) in enumerate(zip(np.round(tl_prec := tf.read_row_groups(rgs, columns=['precursor_mz']).column(0).to_numpy(zero_copy_only=False), 4), Ltr['ik'])): precIdx[p].append(i)
+for i, p in enumerate(np.round(Ltr['prec'], 4).tolist()): precIdx[p].append(i)
 dummyResolved = 0
 for r in te.itertuples():
     p = round(float(r.precursor_mz), 4); qmz = np.asarray(r.ms2_mzs, np.float32)
     for i in precIdx.get(p, []):
         a, b = Ltr['off'][i], Ltr['off'][i + 1]
         if b - a == len(qmz) and (len(qmz) == 0 or np.allclose(Ltr['mz'][a:b][:5], qmz[:5], atol=1e-4)): teKeys.add(Ltr['ik'][i]); dummyResolved += 1; break
-del precIdx, tl_prec
+del precIdx
 R['test'] = dict(rows=int(len(te)), molecules=int(te['molecule_id'].nunique()), spectraResolvedToTrain=dummyResolved, keysResolved=len(teKeys))
 poolCtl = [k for k in poolCtl if k not in teKeys]
 ctlSets = [set(rng.choice(poolCtl, size=min(len(Z), len(poolCtl)), replace=False).tolist()) for _ in range(A.nControl)]
 want = Zset.union(*ctlSets); keep = []
 for b in zf.iter_batches(batch_size=100_000):
-    k = pa.array([s[:14] if s else '' for s in b.column(S['key']).to_pylist()]); m = pc.is_in(k, value_set=pa.array(sorted(want)))
+    k = pc.fill_null(pc.utf8_slice_codeunits(b.column(S['key']).cast(pa.string()), 0, 14), ''); m = pc.is_in(k, value_set=pa.array(sorted(want)))
     if pc.any(m).as_py(): keep.append(pa.Table.from_batches([b]).filter(m))
 ZT = pa.concat_tables(keep); del keep
 zk = np.asarray([s[:14] for s in ZT.column(S['key']).to_pylist()], dtype=object); isZ = np.isin(zk, Z)
@@ -254,22 +273,40 @@ def best_against(L, qmz, qit, target):
     if len(qm) == 0: return -2.0, -1, len(cand)
     sc = search(qm, qp, cand, L['off'], L['mz'], L['it'], CFG.MZ_TOL, CFG.INT_FLOOR, CFG.MAX_PEAKS, CFG.INT_POWER, CFG.ENT_WEIGHT, 1)
     j = int(np.argmax(sc)); return float(sc[j]), int(cand[j]), len(cand)
-bestZ = np.full(ZTz.num_rows, np.nan); bestLib = []; nCand = np.zeros(ZTz.num_rows, int); t = time.time()
-for i in range(ZTz.num_rows):
-    if not np.isfinite(LZ['nm'][i]): bestLib.append(None); continue
-    a, b = LZ['off'][i], LZ['off'][i + 1]; s, j, nc = best_against(Ltr, LZ['mz'][a:b], LZ['it'][a:b], float(LZ['nm'][i])); bestZ[i] = s; nCand[i] = nc; bestLib.append(Ltr['lib'][j] if j >= 0 else None)
+def pmap(fn, items, procs):
+    if procs <= 1 or len(items) <= 1: return [fn(x) for x in items]
+    import multiprocessing as mp
+    with mp.get_context('fork').Pool(procs) as pool: return pool.map(fn, items, chunksize=1)
+PROCS = int(os.environ.get('ZD_PROCS', '1') or 1)   # the kernel's search() is numba parallel=True already; >1 forks workers (needs the workqueue threading layer, set at import)
+def _score_rows(idx):
+    out = []
+    for i in idx:
+        if not np.isfinite(LZ['nm'][i]): out.append((i, np.nan, -1, 0)); continue
+        a, b = LZ['off'][i], LZ['off'][i + 1]; s, j, nc = best_against(Ltr, LZ['mz'][a:b], LZ['it'][a:b], float(LZ['nm'][i])); out.append((i, s, j, nc))
+    return out
+t = time.time()
+if ZTz.num_rows: _score_rows([0])   # numba warm-up in the parent; forked workers inherit the compiled kernels
+nChunk = max(1, min(64, ZTz.num_rows // 50 or 1)); res = pmap(_score_rows, [r.tolist() for r in np.array_split(np.arange(ZTz.num_rows), nChunk)], PROCS)
+bestZ = np.full(ZTz.num_rows, np.nan); nCand = np.zeros(ZTz.num_rows, int); bestLib = [None] * ZTz.num_rows
+for chunk in res:
+    for i, s_, j, nc in chunk: bestZ[i] = s_; nCand[i] = nc; bestLib[i] = Ltr['lib'][j] if j >= 0 else None
+del res; log(f'Z vs train scored with {PROCS} procs ({time.time()-t:.0f}s)')
 perKey = pd.DataFrame(dict(k=LZ['ik'], s=bestZ)).groupby('k').s.max()
 R['Z_vs_train'] = dict(spectraScored=int(np.isfinite(bestZ).sum()), noWindow=int((bestZ == -1).sum()), emptyClean=int((bestZ == -2).sum()), candidatesPerSpectrum=q(nCand[nCand > 0]),
                        spectraGe099=int((bestZ >= 0.99).sum()), spectraGe095=int((bestZ >= 0.95).sum()), spectraGeGate=int((bestZ >= GATE).sum()), hist=hist(bestZ[bestZ >= 0], np.linspace(0, 1, 21)),
                        keysGe099=int((perKey >= 0.99).sum()), keysGeGate=int((perKey >= GATE).sum()), keysScored=int(perKey.notna().sum()), keptRows=dict(n=int(LZ['kept'].sum()), ge099=int((bestZ[LZ['kept']] >= 0.99).sum()), geGate=int((bestZ[LZ['kept']] >= GATE).sum()), hist=hist(bestZ[LZ['kept'] & (bestZ >= 0)], np.linspace(0, 1, 21))), bestLibOfGe099=collections.Counter([l for s, l in zip(bestZ, bestLib) if s >= 0.99]).most_common(8), sec=round(time.time() - t, 1))
 log(f'Z vs train library: spectra >= 0.99 {R["Z_vs_train"]["spectraGe099"]:,}, >= gate {R["Z_vs_train"]["spectraGeGate"]:,}; keys >= gate {R["Z_vs_train"]["keysGeGate"]:,} of {len(perKey):,} ({time.time()-t:.0f}s)')
 # kernel-style per structure: all spectra of the structure fused at the median nm (the kernel's per-molecule rule)
-t = time.time(); lvKey = {}
-for k, idx in pd.Series(np.arange(ZTz.num_rows)).groupby(LZ['ik']).groups.items():
-    idx = np.asarray(list(idx)); nms = LZ['nm'][idx]; nms = nms[np.isfinite(nms)]
-    if nms.size == 0: continue
-    specs = [(LZ['mz'][LZ['off'][i]:LZ['off'][i+1]], LZ['it'][LZ['off'][i]:LZ['off'][i+1]]) for i in idx]
-    hits = lib_sim(Ltr, specs, float(np.median(nms))); lvKey[k] = max(hits.values()) if hits else 0.0
+t = time.time(); groups = list(pd.Series(np.arange(ZTz.num_rows)).groupby(LZ['ik']).groups.items())
+def _fused(items):
+    out = []
+    for k, idx in items:
+        idx = np.asarray(list(idx)); nms = LZ['nm'][idx]; nms = nms[np.isfinite(nms)]
+        if nms.size == 0: continue
+        specs = [(LZ['mz'][LZ['off'][i]:LZ['off'][i+1]], LZ['it'][LZ['off'][i]:LZ['off'][i+1]]) for i in idx]
+        hits = lib_sim(Ltr, specs, float(np.median(nms))); out.append((k, max(hits.values()) if hits else 0.0))
+    return out
+nChunk = max(1, min(64, len(groups))); lvKey = dict(x for chunk in pmap(_fused, [groups[i::nChunk] for i in range(nChunk)], PROCS) for x in chunk)
 lv = np.array(list(lvKey.values())); R['Z_vs_train']['fusedKeys'] = dict(n=int(lv.size), lvMaxGeGate=int((lv >= GATE).sum()), lvMaxGe099=int((lv >= 0.99).sum()), hist=hist(lv, np.linspace(0, 1, 21)), sec=round(time.time() - t, 1))
 
 # ---- 7b. within-structure replicate similarity inside Z: best pair of a structure's own spectra (all rows / host-kept rows only) ----
@@ -368,14 +405,14 @@ def rows_lists(idx, vals, norm=False):
         out.append(v); off.append(off[-1] + v.size)
     return pa.ListArray.from_arrays(pa.array(np.asarray(off, np.int32)), pa.array(np.concatenate(out) if out else np.zeros(0))).cast(LST)
 bpi = np.array([float(LZ['it'][LZ['off'][i]:LZ['off'][i + 1]].max()) if LZ['off'][i + 1] > LZ['off'][i] else np.nan for i in sel])
-smiAll = ZTz.column(S['smiles']).cast(pa.string()).to_pylist() if S['smiles'] else [None] * ZTz.num_rows
+smiAll = ZTz.column(S['smiles']).cast(pa.string()).to_pylist() if S['smiles'] else [None] * ZTz.num_rows; keyAll = ZTz.column(S['key']).cast(pa.string()).to_pylist(); polAll = ZTz.column(S['pol']).cast(pa.string()).to_pylist() if S['pol'] else None; ceAll = ZTz.column(S['ce']).cast(pa.string()).to_pylist() if S['ce'] else None
 cols = {'inchikey14': pa.array([LZ['ik'][i] for i in sel], pa.string()), 'normalized_smiles': pa.array([smiAll[i] for i in sel], pa.string()), 'adduct': pa.array([LZ['kAdd'][i] for i in sel], pa.string()),
         'precursor_mz': pa.array(LZ['prec'][sel].astype(np.float64), pa.float64()), 'ms2_mzs': rows_lists(sel, LZ['mz']), 'ms2_normalized_intensities': rows_lists(sel, LZ['it'], norm=True),
         'base_peak_intensity': pa.array(bpi, pa.float64()), 'num_peaks': pa.array(LZ['npk'][sel].astype(np.int64)), 'ingest_lib': pa.array(['enveda-180-zenodo'] * len(sel), pa.string()),
-        'inchikey': pa.array([ZTz.column(S['key']).cast(pa.string()).to_pylist()[i] for i in sel], pa.string()), 'adduct_orig': pa.array([LZ['add'][i] for i in sel], pa.string()), 'hostKeptAdduct': pa.array([bool(LZ['kept'][i]) for i in sel]),
+        'inchikey': pa.array([keyAll[i] for i in sel], pa.string()), 'adduct_orig': pa.array([LZ['add'][i] for i in sel], pa.string()), 'hostKeptAdduct': pa.array([bool(LZ['kept'][i]) for i in sel]),
         'neutral_mass': pa.array(LZ['nm'][sel].astype(np.float64), pa.float64())}
-if S['pol']: cols['ionization_mode'] = pa.array([ZTz.column(S['pol']).cast(pa.string()).to_pylist()[i] for i in sel], pa.string())
-if S['ce']: cols['collision_energy_orig'] = pa.array([ZTz.column(S['ce']).cast(pa.string()).to_pylist()[i] for i in sel], pa.string())
+if S['pol']: cols['ionization_mode'] = pa.array([polAll[i] for i in sel], pa.string())
+if S['ce']: cols['collision_energy_orig'] = pa.array([ceAll[i] for i in sel], pa.string())
 KT = pa.table(cols); kfile = 'Z_trainlike.parquet'; pq.write_table(KT, os.path.join(A.out, kfile), compression='zstd')
 trSch = pq.read_schema(A.train); six = ['inchikey14', 'normalized_smiles', 'adduct', 'precursor_mz', 'ms2_mzs', 'ms2_normalized_intensities']
 kkeys = set(KT.column('inchikey14').to_pylist()); assert not (kkeys & trainKeys), 'kernel file holds a train key'
