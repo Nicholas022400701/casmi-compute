@@ -191,11 +191,18 @@ if A.zenFiltered and os.path.exists(A.zenFiltered):
 
 # ---- 5. profiles: Z rows vs the rest of the release (every scalar column), spectra per compound, polarity / adduct / CE ----
 def profile(d):
-    out = dict(rows=int(len(d)), keys=int(d['ik14'].nunique()), spectraPerKey=q(d.groupby('ik14').size().values), nPeaks=q(d['nPeaks'].values.astype(float)))
+    spk = d.groupby('ik14').size().values; out = dict(rows=int(len(d)), keys=int(d['ik14'].nunique()), spectraPerKey=q(spk), spectraPerKeyHist=hist(spk, [1, 2, 3, 4, 5, 7, 13, 25, 10000]), nPeaks=q(d['nPeaks'].values.astype(float)))
     for c in numCols:
         if c in d: out[f'num:{c}'] = q(d[c].values.astype(float))
     for c in catCols:
         vc = d[c].astype(str).value_counts(); out[f'cat:{c}'] = dict(nUnique=int(vc.size), top=[(k[:40], int(v)) for k, v in vc.head(12).items()])
+    if S['formula'] and S['formula'] in d:
+        fu = d[S['formula']].astype(str); uniq = pd.Index(fu.unique()); comp = {el: np.zeros(len(uniq)) for el in ('C', 'H', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I')}
+        for j, f in enumerate(uniq):
+            for el, n in _FRE.findall(f.split('+')[0].split('-')[0]):
+                if el in comp: comp[el][j] += int(n) if n else 1
+        pos = uniq.get_indexer(fu); out['elements'] = {el: q(v[pos]) for el, v in comp.items()}; out['elements']['heteroShare'] = q(((comp['N'] + comp['O'] + comp['S'] + comp['P'])[pos]) / np.maximum(1, (comp['C'] + comp['N'] + comp['O'] + comp['S'] + comp['P'])[pos]))
+        out['elements']['halogenAny'] = round(float(((comp['F'] + comp['Cl'] + comp['Br'] + comp['I'])[pos] > 0).mean()), 4); out['formulaMass'] = q(d['nmF'].values.astype(float)) if 'nmF' in d else None
     if 'titleIdx' in d and M['titleIdx'].notna().any():
         lo, hi = float(M['titleIdx'].min()), float(M['titleIdx'].max()); out['positionInFileDeciles'] = hist((d['titleIdx'].values - lo) / max(hi - lo, 1), np.linspace(0, 1, 11))
     return out
@@ -265,25 +272,60 @@ for k, idx in pd.Series(np.arange(ZTz.num_rows)).groupby(LZ['ik']).groups.items(
     hits = lib_sim(Ltr, specs, float(np.median(nms))); lvKey[k] = max(hits.values()) if hits else 0.0
 lv = np.array(list(lvKey.values())); R['Z_vs_train']['fusedKeys'] = dict(n=int(lv.size), lvMaxGeGate=int((lv >= GATE).sum()), lvMaxGe099=int((lv >= 0.99).sum()), hist=hist(lv, np.linspace(0, 1, 21)), sec=round(time.time() - t, 1))
 
+# ---- 7b. within-structure replicate similarity inside Z: best pair of a structure's own spectra (all rows / host-kept rows only) ----
+t = time.time(); cleaned = {}
+def cl(i):
+    if i not in cleaned: cleaned[i] = clean(LZ['mz'][LZ['off'][i]:LZ['off'][i+1]], LZ['it'][LZ['off'][i]:LZ['off'][i+1]])
+    return cleaned[i]
+repAll, repKept = {}, {}
+for k, idx in pd.Series(np.arange(ZTz.num_rows)).groupby(LZ['ik']).groups.items():
+    idx = [int(i) for i in idx]
+    for tag, ids in (('all', idx), ('kept', [i for i in idx if LZ['kept'][i]])):
+        if len(ids) < 2: continue
+        best = 0.0
+        for a in range(len(ids)):
+            qa, pa_ = cl(ids[a])
+            if len(qa) == 0: continue
+            for b in range(a + 1, len(ids)):
+                qb, pb = cl(ids[b])
+                if len(qb) == 0: continue
+                v = float(entropy_sim(qa, pa_, qb, pb, CFG.MZ_TOL)); best = v if v > best else best
+        (repAll if tag == 'all' else repKept)[k] = best
+ra = np.array(list(repAll.values())); rk = np.array(list(repKept.values()))
+R['Z_replicates'] = dict(keysWith2plusSpectra=int(ra.size), bestPairGeGate=int((ra >= GATE).sum()), bestPairGe099=int((ra >= 0.99).sum()), hist=hist(ra, np.linspace(0, 1, 11)),
+                         keptRows=dict(keysWith2plusKeptSpectra=int(rk.size), bestPairGeGate=int((rk >= GATE).sum()), bestPairGe099=int((rk >= 0.99).sum()), hist=hist(rk, np.linspace(0, 1, 11))), sec=round(time.time() - t, 1))
+log(f'within-Z replicates: keys with >= 2 spectra {ra.size:,}, best pair >= gate {R["Z_replicates"]["bestPairGeGate"]:,} (kept rows: {rk.size:,} / {R["Z_replicates"]["keptRows"]["bestPairGeGate"]:,})')
+del cleaned
 # ---- 8. RDKit standardisation collapse of Z structures into train keys ----
 try:
     from rdkit import Chem, RDLogger; from rdkit.Chem.MolStandardize import rdMolStandardize; RDLogger.DisableLog('rdApp.*')
     smiCol = S['smiles']; firstSmi = {}
     for k, s in zip(zk[isZ], ZTz.column(smiCol).to_pylist() if smiCol else [None] * ZTz.num_rows):
         if k not in firstSmi and s: firstSmi[k] = s
-    lf = rdMolStandardize.LargestFragmentChooser(); un = rdMolStandardize.Uncharger(); c = collections.Counter()
+    lf = rdMolStandardize.LargestFragmentChooser(); un = rdMolStandardize.Uncharger(); c = collections.Counter(); stdInfo = {}
     for k, s in firstSmi.items():
         m = Chem.MolFromSmiles(s)
         if m is None: c['parseFail'] += 1; continue
         k0 = Chem.MolToInchiKey(m)[:14]; c['rawKeyEqualsFile'] += int(k0 == k); c['rawKeyInTrain'] += int(k0 in trainKeys)
-        m2 = un.uncharge(lf.choose(m)); k2 = Chem.MolToInchiKey(m2)[:14]; c['stdKeyInTrain'] += int(k2 in trainKeys); c['stdKeyChanged'] += int(k2 != k0)
+        m2 = un.uncharge(lf.choose(m)); k2 = Chem.MolToInchiKey(m2)[:14]; c['stdKeyInTrain'] += int(k2 in trainKeys); c['stdKeyChanged'] += int(k2 != k0); stdInfo[k] = (k0 == k, k2 in trainKeys, k0 in trainKeys)
         try:
             from rdkit.Chem import rdMolDescriptors; c['hasMetal'] += int(any(a.GetSymbol() in ('Na', 'K', 'Li', 'Ca', 'Mg', 'Zn', 'Fe', 'Cu', 'Pt', 'Mn', 'Co', 'Ni', 'Al', 'Ag', 'Au', 'Hg', 'Pb', 'Sn', 'Ti', 'Cr', 'Ba', 'Sr', 'Cs', 'Rb') for a in m.GetAtoms()))
             c['multiFragment'] += int('.' in s)
         except Exception: pass
     R['Z_standardise'] = dict(keysWithSmiles=len(firstSmi), **c); log(f'standardise: std key in train {c["stdKeyInTrain"]:,} of {len(firstSmi):,} (raw key in train {c["rawKeyInTrain"]:,})')
 except Exception as e:
-    R['Z_standardise'] = dict(error=repr(e)[:200]); log('standardise: skipped')
+    R['Z_standardise'] = dict(error=repr(e)[:200]); stdInfo = {}; log('standardise: skipped')
+# per-key table of the Z structures (public release compounds; no test information): spectra counts by adduct class, best similarity vs train, collapse flags
+kt = pd.DataFrame(dict(ik14=LZ['ik'], kAdd=LZ['kAdd'], kept=LZ['kept'], best=bestZ, npk=LZ['npk'], nm=LZ['nm']))
+g = kt.groupby('ik14'); KT0 = pd.DataFrame(dict(nSpectra=g.size(), nKernelAdduct=g.kAdd.apply(lambda v: int((v != '').sum())), nHostKept=g.kept.sum().astype(int), nMH=g.kAdd.apply(lambda v: int((v == '[M+H]+').sum())), nMHneg=g.kAdd.apply(lambda v: int((v == '[M-H]-').sum())),
+                        bestSimVsTrain=g.best.max().round(4), bestSimKeptRows=kt[kt.kept].groupby('ik14').best.max().round(4), nPeaksMedian=g.npk.median(), neutralMass=g.nm.median().round(4)))
+KT0['fusedLvVsTrain'] = pd.Series(lvKey).reindex(KT0.index).round(4); KT0['rawKeyEqualsFile'] = KT0.index.map(lambda k: stdInfo.get(k, (None, None, None))[0]); KT0['stdKeyInTrain'] = KT0.index.map(lambda k: stdInfo.get(k, (None, None, None))[1])
+KT0['dup099'] = KT0.bestSimVsTrain >= 0.99; KT0['genuinelyNew'] = ~KT0.dup099 & ~(KT0.stdKeyInTrain == True)
+KT0['zdevCandidate'] = KT0.genuinelyNew & (KT0.nMH > 0) & (KT0.nHostKept > 0)
+KT0.index.name = 'ik14'; KT0.to_csv(os.path.join(A.out, 'Z_keys_table.csv'))
+R['Z_keysTable'] = dict(rows=int(len(KT0)), genuinelyNew=int(KT0.genuinelyNew.sum()), withMH=int((KT0.nMH > 0).sum()), withHostKeptRow=int((KT0.nHostKept > 0).sum()), zdevCandidates=int(KT0.zdevCandidate.sum()), zdevCandidatesMHrows=int(KT0.loc[KT0.zdevCandidate, 'nMH'].sum()),
+                       zdevCandidateMass=q(KT0.loc[KT0.zdevCandidate, 'neutralMass'].values), zdevCandidateSpectraPerKey=q(KT0.loc[KT0.zdevCandidate, 'nSpectra'].values), zdevCandidateFusedLv=hist(KT0.loc[KT0.zdevCandidate, 'fusedLvVsTrain'].fillna(0).values, np.linspace(0, 1, 11)))
+log(f'per-key table: {len(KT0):,} Z keys, genuinely new {R["Z_keysTable"]["genuinelyNew"]:,}, Z-DEV candidates (new + [M+H]+ + host-kept row) {R["Z_keysTable"]["zdevCandidates"]:,}')
 
 # ---- 9. the visible test file vs Z (treatment) and vs the control draws — the kernel's lib gate, per molecule (fused) and per spectrum ----
 te['nm'] = neutral_mass(te['precursor_mz'].to_numpy(np.float64), np.asarray(te['adduct'].astype(str).tolist(), dtype=object))
